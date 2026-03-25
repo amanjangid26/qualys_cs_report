@@ -2,7 +2,7 @@
 """
 =============================================================================
   Qualys Container Security — Image Report Generator
-  Version: 2.1.0
+  Version: 2.2.0
 =============================================================================
 
   WHAT THIS SCRIPT DOES:
@@ -25,8 +25,10 @@
       "vulnerabilities.title:EOL". This returns only images where Qualys
       has detected that the base operating system is end-of-life.
       We collect their SHA hashes and compare them against Phase 1:
-          SHA found in both → EOL_Base_OS = True
-          SHA only in Phase 1 → EOL_Base_OS = False
+          SHA found in both AND image has an OS → EOL_Base_OS = True
+          SHA only in Phase 1 AND image has an OS → EOL_Base_OS = False
+          Image has NO OS (distroless/scratch) → EOL_Base_OS = empty
+              (evaluating EOL on a non-existent OS makes no sense)
 
   Phase 3 — CONTAINER COUNTS (parallel)
       For each unique image SHA from Phase 1, calls the Container API
@@ -39,6 +41,7 @@
   Phase 4 — REPORT GENERATION
       Combines all the data into a single flat CSV file (one row per
       vulnerability or software per image) and a JSON file.
+      CSV has 32 columns including Software_Package_Path.
 
   Phase 5 — RUN SUMMARY
       Writes a summary JSON with stats: how many images, vulns, API calls,
@@ -82,7 +85,7 @@ from datetime import datetime, timezone  # timestamps
 # =============================================================================
 # VERSION
 # =============================================================================
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 # =============================================================================
@@ -948,7 +951,9 @@ def build_enriched_image_list(raw_images, eol_sha_set, container_counts, skip_co
 
     Each enriched record contains:
     - All image metadata (ID, SHA, OS, architecture, dates, etc.)
-    - EOL flag (True if SHA was returned by the EOL-filtered API call)
+    - EOL flag: True/False ONLY if the image has an operating system.
+      If OS is empty (distroless/scratch images), EOL is left empty
+      because evaluating EOL on a non-existent OS makes no sense.
     - Container count (from Container API, or "N/A" if skipped)
     - Full software and vulnerability lists (for CSV row generation)
     """
@@ -958,12 +963,20 @@ def build_enriched_image_list(raw_images, eol_sha_set, container_counts, skip_co
         image_sha = image.get("sha", "")
         vulnerabilities = image.get("vulnerabilities") or []
         softwares = image.get("softwares") or []
+        operating_system = convert_to_safe_string(image.get("operatingSystem"))
+
+        # EOL evaluation: only meaningful when OS is known.
+        # Distroless/scratch images have no OS → EOL should be empty, not False.
+        if operating_system:
+            eol_base_os = image_sha in eol_sha_set  # True or False
+        else:
+            eol_base_os = ""  # empty — cannot evaluate EOL without an OS
 
         enriched.append({
             "image_id":           convert_to_safe_string(image.get("imageId")),
             "image_sha":          image_sha,
-            "operating_system":   convert_to_safe_string(image.get("operatingSystem")),
-            "eol_base_os":        image_sha in eol_sha_set,
+            "operating_system":   operating_system,
+            "eol_base_os":        eol_base_os,
             "architecture":       convert_to_safe_string(image.get("architecture")),
             "created":            convert_epoch_ms_to_iso(image.get("created")),
             "last_scanned":       convert_epoch_ms_to_iso(image.get("lastScanned")),
@@ -983,11 +996,15 @@ def build_enriched_image_list(raw_images, eol_sha_set, container_counts, skip_co
 
 
 # =============================================================================
-# CSV REPORT — 31 columns, fully denormalized
+# CSV REPORT — 32 columns, fully denormalized
 #
 # The CSV has one row per (image × repo × vulnerability/software).
 # This means image-level data is repeated, but you can filter in Excel
 # by any column without needing pivot tables or VLOOKUPs.
+#
+# EOL_Base_OS logic:
+#   - Image HAS an OS → True or False based on EOL API match
+#   - Image has NO OS (distroless/scratch) → empty (not evaluated)
 #
 # Row generation (for each image × each registry/repo/tag):
 #   Pass 1: One row per vulnerability × affected software
@@ -1003,8 +1020,9 @@ CSV_HEADERS = [
     "Risk_Score", "Max_QDS_Score", "QDS_Severity",
     "Total_Vulnerabilities_On_Image", "Running_Container_Count",
 
-    # Software columns (7)
+    # Software columns (8)
     "Software_Name", "Software_Installed_Version", "Software_Fix_Version",
+    "Software_Package_Path",
     "Software_Lifecycle_Stage", "Software_GA_Date", "Software_EOL_Date", "Software_EOS_Date",
 
     # Vulnerability columns (7)
@@ -1013,7 +1031,7 @@ CSV_HEADERS = [
 ]
 
 IMAGE_COLUMN_COUNT    = 17
-SOFTWARE_COLUMN_COUNT = 7
+SOFTWARE_COLUMN_COUNT = 8   # was 7, added Package_Path
 VULN_COLUMN_COUNT     = 7
 EMPTY_SOFTWARE_COLS   = [""] * SOFTWARE_COLUMN_COUNT
 EMPTY_VULN_COLS       = [""] * VULN_COLUMN_COUNT
@@ -1043,12 +1061,13 @@ def build_image_columns(image, repo):
 
 
 def build_software_columns(software):
-    """Build the 7 software-level columns for one CSV row."""
+    """Build the 8 software-level columns for one CSV row."""
     lifecycle = software.get("lifecycle") or {}
     return [
         convert_to_safe_string(software.get("name")),
         convert_to_safe_string(software.get("version")),
         convert_to_safe_string(software.get("fixVersion")),
+        convert_to_safe_string(software.get("packagePath")),  # e.g. "app/bin/myapp" or null
         convert_to_safe_string(lifecycle.get("stage")),
         convert_epoch_ms_to_iso(lifecycle.get("gaDate")),
         convert_epoch_ms_to_iso(lifecycle.get("eolDate")),
