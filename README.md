@@ -2,7 +2,7 @@
 
 Enterprise CLI tool that pulls container image records from Qualys CSAPI, enriches them with running container counts and EOL base OS status, and produces a unified CSV + JSON report.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com)
 [![Python](https://img.shields.io/badge/python-3.8%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)](LICENSE)
 
@@ -125,6 +125,7 @@ python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" -q
 | `-o`, `--output-dir` | Output directory | `./qualys_report_output` |
 | `--skip-containers` | Skip container count API calls | false |
 | `--force` | Ignore checkpoint, start fresh | false |
+| `--concurrency` | Parallel threads for container counts | 10 |
 | `-r`, `--retries` | Max retries per API call | 5 |
 | `-C`, `--curl-extra` | Extra curl args (e.g. `--proxy`) | — |
 | `-v`, `--verbose` | Debug output | false |
