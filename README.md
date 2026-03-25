@@ -1,8 +1,8 @@
-# Qualys Container Security - Image Report Generator
+# Qualys Container Security — Image Report Generator
 
 Enterprise CLI tool that pulls container image records from Qualys CSAPI, enriches them with running container counts, EOL base OS status, and software lifecycle dates, and produces a unified CSV + JSON report.
 
-[![Version](https://img.shields.io/badge/version-2.1.0-blue)](https://github.com/amanjangid26/qualys_cs_report)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue)](https://github.com/amanjangid26/qualys_cs_report)
 [![Python](https://img.shields.io/badge/python-3.8%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)](LICENSE)
 
@@ -156,14 +156,14 @@ qualys_report_output/
 └── raw/                             ← Intermediate data
 ```
 
-### CSV Columns (31)
+### CSV Columns (32)
 
 | # | Column | Description |
 |---|--------|-------------|
 | 1 | `Image_ID` | Short 12-char image ID |
 | 2 | `Image_SHA` | Full SHA256 |
 | 3 | `Operating_System` | e.g. Debian Linux 12.13 |
-| 4 | `EOL_Base_OS` | `True` if Qualys flags base OS as EOL |
+| 4 | `EOL_Base_OS` | `True`/`False` if OS present; empty for distroless/scratch images |
 | 5 | `Architecture` | arm64, amd64 |
 | 6 | `Image_Created` | Creation timestamp (empty if unavailable) |
 | 7 | `Image_Last_Scanned` | Last Qualys scan |
@@ -180,17 +180,18 @@ qualys_report_output/
 | 18 | `Software_Name` | Installed package |
 | 19 | `Software_Installed_Version` | Current version |
 | 20 | `Software_Fix_Version` | Fix version |
-| 21 | `Software_Lifecycle_Stage` | EOL/EOS, GA, Beta, etc. |
-| 22 | `Software_GA_Date` | General availability date |
-| 23 | `Software_EOL_Date` | End of life date |
-| 24 | `Software_EOS_Date` | End of support date |
-| 25 | `Vuln_QID` | Qualys vulnerability ID |
-| 26 | `Vuln_Scan_Type` | How this vuln was found (SCA/STATIC/DYNAMIC) |
-| 27 | `Vuln_Type_Detected` | CONFIRMED / POTENTIAL |
-| 28 | `Vuln_First_Found` | First detection date |
-| 29 | `Vuln_Affected_Software_Name` | Affected package |
-| 30 | `Vuln_Affected_Software_Version` | Affected version |
-| 31 | `Vuln_Fix_Version` | Remediation version |
+| 21 | `Software_Package_Path` | File path of the package (e.g. app/bin/myapp) |
+| 22 | `Software_Lifecycle_Stage` | EOL/EOS, GA, Beta, etc. |
+| 23 | `Software_GA_Date` | General availability date |
+| 24 | `Software_EOL_Date` | End of life date |
+| 25 | `Software_EOS_Date` | End of support date |
+| 26 | `Vuln_QID` | Qualys vulnerability ID |
+| 27 | `Vuln_Scan_Type` | How this vuln was found (SCA/STATIC/DYNAMIC) |
+| 28 | `Vuln_Type_Detected` | CONFIRMED / POTENTIAL |
+| 29 | `Vuln_First_Found` | First detection date |
+| 30 | `Vuln_Affected_Software_Name` | Affected package |
+| 31 | `Vuln_Affected_Software_Version` | Affected version |
+| 32 | `Vuln_Fix_Version` | Remediation version |
 
 ### Row Logic
 
@@ -281,6 +282,7 @@ HTTP 429             →  ALL threads pause (Retry-After or window reset)
 | `Running_Container_Count = N/A` | Used `--skip-containers` |
 | `Image_Created empty` | Qualys API returns epoch 0 for some images (no creation date recorded) |
 | `Operating_System empty` | Qualys couldn't detect the base OS (scratch/distroless images) |
+| `EOL_Base_OS empty` | No OS detected — EOL evaluation is skipped for distroless images |
 | Slow run | Use `--skip-containers`, or increase `--concurrency` and `--cps` |
 
 ---
