@@ -1,134 +1,197 @@
 #!/usr/bin/env python3
 """
-Qualys Container Security — Image Report Generator
-====================================================
-Version: 2.0.0
+=============================================================================
+  Qualys Container Security — Image Report Generator
+  Version: 2.1.0
+=============================================================================
 
-This script pulls container image data from Qualys CSAPI and produces
-a single CSV + JSON report containing:
-  - Image details (registry, repo, tag, OS, architecture)
-  - Software inventory with lifecycle/EOL dates
-  - Vulnerabilities with fix versions
-  - Running container count per image
-  - EOL Base OS flag (True/False/blank)
+  WHAT THIS SCRIPT DOES:
 
-HOW IT WORKS (5 Phases):
-  Phase 1: Fetch all images via Image Bulk API (paginated)
-  Phase 2: Fetch EOL images via Image Bulk API with EOL filter
-           Compare SHAs from Phase 1 vs Phase 2 to set EOL_Base_OS
-  Phase 3: Fetch running container count per image SHA (PARALLEL)
-  Phase 4: Combine all data into CSV + JSON
-  Phase 5: Write run summary
+  It talks to Qualys Container Security APIs and builds a single CSV + JSON
+  report containing every container image, its installed software, known
+  vulnerabilities, lifecycle dates, running container count, and whether
+  the base operating system is end-of-life.
 
-IMPORTANT DESIGN DECISIONS:
-  - HTTP 204 from Container API = 0 running containers (NOT an error)
-  - OS is blank → EOL_Base_OS is also blank (can't determine EOL without OS)
-  - created='0' in API means unknown → Image_Created is blank in CSV
-  - Multi-repo images get separate rows per registry (no pipe-delimited)
-  - Phase 3 uses parallel threads with a GLOBAL rate limiter
-  - All threads share one rate-limit token bucket to avoid 429 storms
+  HOW IT WORKS (5 phases):
 
-IDEMPOTENT: Re-run safely. Completed phases are skipped via checkpoint.
-            Use --force for a fresh start.
+  Phase 1 — IMAGE LIST
+      Calls the Qualys Image Bulk API to fetch all container images that
+      were in use during the last N days. Handles pagination automatically
+      (the API returns 250 images per page, so if you have 5000 images,
+      it fetches 20 pages).
 
-PREREQUISITES: Python 3.8+, curl (no pip packages needed)
+  Phase 2 — EOL BASE OS DETECTION
+      Calls the same Image API but with an extra filter:
+      "vulnerabilities.title:EOL". This returns only images where Qualys
+      has detected that the base operating system is end-of-life.
+      We collect their SHA hashes and compare them against Phase 1:
+          SHA found in both → EOL_Base_OS = True
+          SHA only in Phase 1 → EOL_Base_OS = False
+
+  Phase 3 — CONTAINER COUNTS (parallel)
+      For each unique image SHA from Phase 1, calls the Container API
+      to find out how many running containers are using that image.
+      This tells you the "blast radius" — if an image has a critical
+      vulnerability and 50 running containers, that's urgent.
+      Uses multiple threads (default: 5) for speed, with a global
+      rate limiter so we don't exceed Qualys API limits.
+
+  Phase 4 — REPORT GENERATION
+      Combines all the data into a single flat CSV file (one row per
+      vulnerability or software per image) and a JSON file.
+
+  Phase 5 — RUN SUMMARY
+      Writes a summary JSON with stats: how many images, vulns, API calls,
+      how long it took, etc.
+
+  IDEMPOTENT (safe to re-run):
+      Each phase saves a checkpoint. If the script crashes or you press
+      Ctrl+C, just run it again — it picks up where it left off.
+      Use --force to start completely fresh.
+
+  PREREQUISITES:
+      Python 3.8 or newer
+      curl (command-line tool — pre-installed on most systems)
+      No pip packages needed — uses only Python standard library.
+
+=============================================================================
 """
 
-# ============================================================================
-# Imports (all standard library — no pip install needed)
-# ============================================================================
-import argparse
-import atexit
-import concurrent.futures
-import csv
-import hashlib
-import json
-import logging
-import os
-import random
-import re
-import signal
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-from datetime import datetime, timezone
-from typing import Dict, List, Set
+# =============================================================================
+# IMPORTS — all from Python standard library (no pip install needed)
+# =============================================================================
+import argparse          # command-line argument parsing
+import atexit            # run cleanup code when script exits
+import concurrent.futures  # parallel execution (thread pool)
+import csv               # CSV file writing
+import hashlib           # config fingerprint for checkpoint
+import json              # JSON parsing and writing
+import logging           # structured logging to console + file
+import os                # file/directory operations
+import random            # jitter for retry backoff
+import re                # regex for parsing Link headers
+import signal            # catch Ctrl+C gracefully
+import subprocess        # run curl commands
+import sys               # exit codes, stderr
+import tempfile          # atomic file writes
+import threading         # thread-safe locks for parallel execution
+import time              # timing, sleep
+from datetime import datetime, timezone  # timestamps
 
-VERSION = "2.0.0"
 
-# ============================================================================
-# Default Configuration
-# All values can be overridden via CLI flags or environment variables.
-# ============================================================================
+# =============================================================================
+# VERSION
+# =============================================================================
+VERSION = "2.1.0"
+
+
+# =============================================================================
+# DEFAULT CONFIGURATION
+# All of these can be overridden via command-line flags or environment variables.
+# =============================================================================
 DEFAULT_GATEWAY             = "https://gateway.qg2.apps.qualys.com"
 DEFAULT_API_VERSION         = "v1.3"
-DEFAULT_PAGE_LIMIT          = 250    # max records per API page (Qualys max = 250)
-DEFAULT_IMAGE_LOOKBACK_DAYS = 30     # fetch images used in the last N days
-DEFAULT_CONTAINER_SCAN_DAYS = 3      # container scan lookback for running count
-DEFAULT_MAX_RETRIES         = 2      # max retries per failed API call (fail fast)
-DEFAULT_CONNECT_TIMEOUT     = 15     # curl connect timeout in seconds
-DEFAULT_REQUEST_TIMEOUT     = 60     # curl max time per request in seconds
-DEFAULT_THREAD_COUNT        = 5      # parallel threads for container count
-DEFAULT_CALLS_PER_SECOND    = 2      # max API calls/sec across ALL threads
+DEFAULT_PAGE_LIMIT          = 250   # max images per API page (Qualys max is 250)
+DEFAULT_IMAGE_LOOKBACK_DAYS = 30    # fetch images used in the last N days
+DEFAULT_CONTAINER_SCAN_DAYS = 3     # container scan lookback for running count
+DEFAULT_MAX_RETRIES         = 2     # retry failed API calls up to 2 times (fail fast)
+DEFAULT_CONNECT_TIMEOUT     = 15    # seconds to wait for connection
+DEFAULT_REQUEST_TIMEOUT     = 60    # seconds max per request
+DEFAULT_THREAD_COUNT        = 5     # parallel threads for container counts
+DEFAULT_CALLS_PER_SECOND    = 2     # max API calls per second (across all threads)
 
 
-# ============================================================================
-# Signal Handling — Ctrl+C saves state instead of crashing
-# ============================================================================
-_shutdown_requested = False
+# =============================================================================
+# GRACEFUL SHUTDOWN — Ctrl+C saves state instead of crashing
+# =============================================================================
+shutdown_requested = False
 
-def _handle_signal(signal_number, _frame):
-    """When user presses Ctrl+C or script receives SIGTERM,
-    set a flag so the current operation finishes and state is saved."""
-    global _shutdown_requested
+def handle_shutdown_signal(signal_number, _frame):
+    """Called when user presses Ctrl+C or system sends SIGTERM (e.g. kill).
+    Sets a flag so the main loops can exit cleanly and save progress."""
+    global shutdown_requested
     signal_name = signal.Signals(signal_number).name
-    print(f"\n[!] {signal_name} received — saving state...", file=sys.stderr)
-    _shutdown_requested = True
+    print(f"\n[!] {signal_name} received — saving progress and exiting...", file=sys.stderr)
+    shutdown_requested = True
 
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+# Register the handler for both Ctrl+C (SIGINT) and kill (SIGTERM)
+signal.signal(signal.SIGINT, handle_shutdown_signal)
+signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
-def _exit_if_shutdown():
-    """Check if shutdown was requested. Called inside all loops."""
-    if _shutdown_requested:
+def check_if_shutdown_requested():
+    """Called inside loops. If Ctrl+C was pressed, exit with code 130.
+    The checkpoint file is already saved, so next run will resume."""
+    if shutdown_requested:
         raise SystemExit(130)
 
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
-def safe_string(value) -> str:
-    """Convert None or the literal string 'None' to empty string.
-    The Qualys API sometimes returns the STRING 'None' instead of null."""
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def convert_to_safe_string(value):
+    """Convert any value to a string safe for CSV output.
+
+    - Python None → empty string
+    - The literal string "None" (which Qualys API sometimes returns
+      instead of null) → empty string
+    - Everything else → str(value)
+
+    Examples:
+        convert_to_safe_string(None)      → ""
+        convert_to_safe_string("None")    → ""
+        convert_to_safe_string(12345)     → "12345"
+        convert_to_safe_string("openssl") → "openssl"
+    """
     if value is None or value == "None":
         return ""
     return str(value)
 
 
-def epoch_milliseconds_to_iso(epoch_ms) -> str:
-    """Convert Qualys epoch-milliseconds timestamp to ISO 8601.
-    Example: 1774303950426 → '2026-03-23T22:12:30Z'
-    Returns empty string for null, zero, or invalid values."""
-    if not epoch_ms or str(epoch_ms) == "0":
+def convert_epoch_ms_to_iso(epoch_milliseconds):
+    """Convert a Qualys timestamp (epoch milliseconds) to ISO 8601 format.
+
+    Qualys stores timestamps as milliseconds since Jan 1, 1970.
+    Example: 1774303950426 → "2026-03-23T22:12:30Z"
+
+    Special cases:
+        - None or empty → ""
+        - "0" → "" (not "1970-01-01" — epoch 0 means "no date recorded")
+
+    Args:
+        epoch_milliseconds: string or int like "1774303950426" or 0
+
+    Returns:
+        ISO 8601 string like "2026-03-23T22:12:30Z", or "" if no valid date
+    """
+    if not epoch_milliseconds or str(epoch_milliseconds) == "0":
         return ""
     try:
-        timestamp = int(epoch_ms) / 1000.0
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seconds = int(epoch_milliseconds) / 1000
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (ValueError, TypeError, OSError):
-        return str(epoch_ms)
+        return str(epoch_milliseconds)
 
 
-def write_json_atomically(file_path: str, data):
-    """Write JSON to a temporary file first, then rename it into place.
-    This prevents corrupt files if the script crashes mid-write."""
-    directory = os.path.dirname(file_path)
-    file_descriptor, temp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+def write_json_atomically(file_path, data):
+    """Write JSON data to a file without risk of corruption.
+
+    Why "atomically"? If the script crashes mid-write, the file could be
+    half-written and corrupt. Instead, we:
+    1. Write to a temporary file (e.g. report.json.tmp)
+    2. Rename the temp file to the final name (this is instant on the OS)
+
+    If the script crashes during step 1, the temp file is garbage but the
+    original file is untouched. If it crashes during step 2... well, rename
+    is atomic on any filesystem, so it can't half-happen.
+    """
+    file_descriptor, temp_path = tempfile.mkstemp(
+        dir=os.path.dirname(file_path), suffix=".tmp"
+    )
     try:
         with os.fdopen(file_descriptor, "w") as temp_file:
             json.dump(data, temp_file, indent=2, default=str)
-        os.replace(temp_path, file_path)  # atomic on same filesystem
+        os.replace(temp_path, file_path)
     except Exception:
         try:
             os.remove(temp_path)
@@ -137,27 +200,40 @@ def write_json_atomically(file_path: str, data):
         raise
 
 
-def format_duration(seconds: int) -> str:
-    """Format seconds into human-readable string: 45s, 3m12s, 1h5m."""
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m{seconds % 60}s"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60}m"
+def format_duration(total_seconds):
+    """Format seconds into human-readable duration.
+
+    Examples:
+        45    → "45s"
+        125   → "2m5s"
+        3700  → "1h1m"
+    """
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    if total_seconds < 3600:
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes}m{seconds}s"
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{hours}h{minutes}m"
 
 
-def remove_file(file_path):
-    """Silently remove a file. No error if it doesn't exist."""
+def remove_file_silently(file_path):
+    """Delete a file without throwing an error if it doesn't exist."""
     try:
         os.remove(file_path)
     except OSError:
         pass
 
 
-def generate_config_fingerprint(args) -> str:
-    """Create a short hash of all settings that affect API data.
-    If the user changes --days, --filter, etc., the checkpoint auto-resets
-    so stale cached data isn't mixed with new parameters."""
+def generate_config_fingerprint(args):
+    """Create a short hash of the configuration that affects API data.
+
+    Used by the checkpoint system: if you change --days, --filter, etc.,
+    the fingerprint changes, and the checkpoint auto-resets so you don't
+    mix stale cached data with new parameters.
+    """
     config_string = (
         f"{args.gateway}|{args.days}|{args.container_scan_days}"
         f"|{args.limit}|{args.skip_containers}|{args.filter or ''}"
@@ -165,28 +241,38 @@ def generate_config_fingerprint(args) -> str:
     return hashlib.sha256(config_string.encode()).hexdigest()[:16]
 
 
-def build_image_api_filter(lookback_days: int, extra_filter: str = "") -> str:
-    """Build the URL-encoded filter string for the Image List API.
-    Base: imagesInUse:[now-30d ... now]
-    If extra_filter is provided (e.g. 'operatingSystem:Ubuntu'),
-    it's appended with AND."""
-    base_filter = f"imagesInUse%3A%60%5Bnow-{lookback_days}d%20...%20now%5D%60"
+def build_image_api_filter(lookback_days, extra_filter=""):
+    """Build the URL-encoded filter string for the Qualys Image List API.
+
+    Base filter: "imagesInUse:[now-30d ... now]"
+    (URL-encoded because the API requires it)
+
+    If extra_filter is provided (e.g. "operatingSystem:Ubuntu"), it's
+    appended with AND:
+    "imagesInUse:[now-30d ... now] and operatingSystem:Ubuntu"
+    """
+    base = f"imagesInUse%3A%60%5Bnow-{lookback_days}d%20...%20now%5D%60"
     if extra_filter:
         encoded_extra = extra_filter.replace(" ", "%20")
-        return f"{base_filter}%20and%20{encoded_extra}"
-    return base_filter
+        return f"{base}%20and%20{encoded_extra}"
+    return base
 
 
-# ============================================================================
-# Logging — writes to both console and a log file
-# ============================================================================
-def setup_logging(output_directory, verbose, quiet):
-    """Configure dual logging: file (always verbose) + console (user-controlled)."""
+# =============================================================================
+# LOGGING — writes to both console (for humans) and a log file (for debugging)
+# =============================================================================
+
+def setup_logging(output_directory, verbose_mode, quiet_mode):
+    """Create a logger that writes to both console and a timestamped log file.
+
+    - Console: shows INFO messages (or DEBUG if --verbose, nothing if --quiet)
+    - Log file: always captures everything (DEBUG level) for troubleshooting
+    """
     logger = logging.getLogger("qualys")
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
+    logger.handlers.clear()  # prevent duplicate handlers on re-run
 
-    # Log file — captures everything including DEBUG
+    # Log file — always verbose, timestamps included
     log_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file_path = os.path.join(output_directory, log_filename)
     file_handler = logging.FileHandler(log_file_path)
@@ -194,132 +280,166 @@ def setup_logging(output_directory, verbose, quiet):
     file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s"))
     logger.addHandler(file_handler)
 
-    # Console — INFO by default, DEBUG if --verbose, nothing if --quiet
-    if not quiet:
+    # Console — controlled by --verbose and --quiet flags
+    if not quiet_mode:
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        console_handler.setLevel(logging.DEBUG if verbose_mode else logging.INFO)
         console_handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(console_handler)
 
     return logger, log_file_path
 
 
-# ============================================================================
-# Lock File — prevents two instances from running simultaneously
-# ============================================================================
-def acquire_lock(output_directory, force):
-    """Create a .lock file with our PID. If another instance is running
-    (PID is alive), refuse to start unless --force is used."""
+# =============================================================================
+# LOCK FILE — prevents two copies of the script from running simultaneously
+# =============================================================================
+
+def acquire_lock_file(output_directory, force_mode):
+    """Create a .lock file with our process ID.
+
+    If another instance is already running (its PID is still alive),
+    we refuse to start — unless --force is used.
+
+    The lock file is automatically deleted when the script exits
+    (via atexit), even if it crashes.
+    """
     lock_path = os.path.join(output_directory, ".lock")
 
     if os.path.exists(lock_path):
         try:
             existing_pid = int(open(lock_path).read().strip())
-            os.kill(existing_pid, 0)  # check if process is alive (signal 0 = no-op)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass  # PID is dead — stale lock, safe to override
-        else:
-            if not force:
-                print(f"ERROR: Another instance running (PID {existing_pid}). Use --force.", file=sys.stderr)
+            os.kill(existing_pid, 0)  # check if process is alive (doesn't actually kill it)
+            # If we get here, the process IS alive
+            if not force_mode:
+                print(f"ERROR: Another instance is running (PID {existing_pid}). Use --force to override.",
+                      file=sys.stderr)
                 sys.exit(1)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # stale lock from a dead process — safe to take over
 
-    # Write our PID to the lock file
+    # Write our PID and register cleanup
     open(lock_path, "w").write(str(os.getpid()))
-    # Auto-remove lock when script exits (normal or error)
-    atexit.register(lambda: remove_file(lock_path))
+    atexit.register(lambda: remove_file_silently(lock_path))
 
 
-# ============================================================================
-# Checkpoint — enables idempotent resume after crash or Ctrl+C
-# ============================================================================
-class Checkpoint:
-    """Tracks which phases are done. Saved to .checkpoint.json.
-    On re-run: completed phases are skipped (idempotent).
-    If config changes (different fingerprint), checkpoint auto-resets."""
+# =============================================================================
+# CHECKPOINT — enables the script to resume after crashes (idempotent)
+# =============================================================================
 
-    def __init__(self, output_directory, fingerprint):
+class CheckpointManager:
+    """Tracks which phases are complete. Saved to disk as JSON.
+
+    How it works:
+    - After Phase 1 completes, we call checkpoint.mark_complete("images")
+    - If the script crashes during Phase 3, Phase 1 and 2 are still marked done
+    - On re-run, Phases 1 and 2 are skipped (data loaded from cache)
+    - Phase 3 resumes from where it left off
+
+    If you change the config (e.g. --days 7 instead of --days 30), the
+    fingerprint changes and the checkpoint auto-resets to avoid mixing
+    stale data with new parameters.
+    """
+
+    def __init__(self, output_directory, config_fingerprint):
         self.file_path = os.path.join(output_directory, ".checkpoint.json")
-        self.fingerprint = fingerprint
+        self.fingerprint = config_fingerprint
         self.state = {}
 
+        # Load existing checkpoint if it exists
         if os.path.exists(self.file_path):
             try:
                 self.state = json.load(open(self.file_path))
-                # If config changed since last run, start fresh
-                if self.state.get("fingerprint") != fingerprint:
+                # If config changed, discard the old checkpoint
+                if self.state.get("fingerprint") != config_fingerprint:
                     self.state = {}
             except (json.JSONDecodeError, KeyError):
                 self.state = {}
 
-    def is_done(self, phase_name: str) -> bool:
-        """Check if a phase was already completed."""
+    def is_phase_complete(self, phase_name):
+        """Check if a phase was already completed in a previous run."""
         return self.state.get(phase_name) is True
 
-    def mark_done(self, phase_name: str):
-        """Mark a phase as completed and save to disk."""
+    def mark_complete(self, phase_name):
+        """Mark a phase as done and save to disk immediately."""
         self.state[phase_name] = True
         self.state["fingerprint"] = self.fingerprint
         write_json_atomically(self.file_path, self.state)
 
-    def clear(self):
-        """Delete checkpoint to force a fresh start."""
-        remove_file(self.file_path)
+    def clear_all(self):
+        """Reset checkpoint — used with --force."""
+        remove_file_silently(self.file_path)
         self.state = {}
 
 
-# ============================================================================
-# Global Rate Limiter — coordinates ALL threads to respect API limits
+# =============================================================================
+# GLOBAL RATE LIMITER — coordinates ALL threads to respect Qualys API limits
 #
-# The Qualys API returns these headers:
-#   X-RateLimit-Remaining: calls left in the current time window
-#   X-RateLimit-Window-Sec: window duration in seconds
-#   Retry-After: seconds to wait (only on HTTP 429)
+# Qualys returns these headers on every API response:
+#   X-RateLimit-Remaining: 287   (calls left in current window)
+#   X-RateLimit-Window-Sec: 300  (window = 5 minutes)
+#   Retry-After: 30              (only on HTTP 429 — "please wait this long")
 #
-# This rate limiter uses a token bucket pattern:
-#   - Every thread calls acquire() BEFORE making an API call
-#   - acquire() blocks until a token is available (based on calls_per_second)
-#   - When ANY thread gets remaining=0 or HTTP 429, ALL threads pause
-#   - As remaining drops below 20, speed auto-reduces to 1 call/sec
-# ============================================================================
+# Our strategy:
+#   1. Every thread calls acquire() BEFORE making an API call
+#   2. acquire() blocks until it's safe to proceed
+#   3. A "token bucket" ensures we don't exceed calls_per_second
+#   4. If any thread gets 429 or sees remaining=0, ALL threads pause
+# =============================================================================
+
 class GlobalRateLimiter:
+    """Thread-safe rate limiter that coordinates all parallel API calls."""
+
     def __init__(self, max_calls_per_second, logger):
-        self.minimum_interval = 1.0 / max_calls_per_second  # seconds between calls
+        self.minimum_interval = 1.0 / max_calls_per_second  # e.g. 0.5s for 2 cps
         self.logger = logger
-        self._lock = threading.Lock()        # thread safety
-        self._last_call_time = 0.0           # when the last call was made
-        self._global_pause_until = 0.0       # all threads pause until this time
-        self.api_limit = None                # from X-RateLimit-Limit header
-        self.api_remaining = None            # from X-RateLimit-Remaining header
-        self.api_window_seconds = None       # from X-RateLimit-Window-Sec header
-        self.total_throttle_events = 0       # how many times we had to wait
-        self.total_throttle_seconds = 0      # total time spent waiting
+        self.lock = threading.Lock()
+        self.last_call_time = 0.0
+        self.global_pause_until = 0.0  # all threads wait until this timestamp
+        self.last_known_remaining = None
+        self.last_known_window = None
+        self.total_throttle_events = 0
+        self.total_throttle_seconds = 0
 
     def acquire(self):
         """Block until it's safe to make an API call.
-        Every thread must call this BEFORE making a curl request."""
+
+        Every thread must call this before making a request.
+        It enforces:
+        - Global pause (after 429 or remaining=0)
+        - Minimum interval between calls (token bucket)
+        """
         while True:
-            _exit_if_shutdown()
-            with self._lock:
+            check_if_shutdown_requested()
+            with self.lock:
                 now = time.time()
 
-                # If globally paused (429 or rate limit exhausted), wait
-                if now < self._global_pause_until:
-                    wait_time = self._global_pause_until - now
-                else:
-                    # Enforce minimum interval between calls
-                    elapsed_since_last = now - self._last_call_time
-                    if elapsed_since_last < self.minimum_interval:
-                        wait_time = self.minimum_interval - elapsed_since_last
-                    else:
-                        # Token available — proceed
-                        self._last_call_time = time.time()
-                        return
+                # If globally paused (429 recovery), wait
+                if now < self.global_pause_until:
+                    wait_seconds = self.global_pause_until - now
+                    self.lock.release()
+                    time.sleep(wait_seconds)
+                    self.lock.acquire()
+                    continue
 
-            # Sleep outside the lock (so other threads aren't blocked)
-            time.sleep(wait_time)
+                # Enforce minimum interval between calls
+                time_since_last = now - self.last_call_time
+                if time_since_last < self.minimum_interval:
+                    wait_seconds = self.minimum_interval - time_since_last
+                    self.lock.release()
+                    time.sleep(wait_seconds)
+                    self.lock.acquire()
+                    continue
 
-    def update_from_response_headers(self, header_file_path):
-        """Read rate-limit headers from a curl -D dump file and adapt speed."""
+                # All clear — record this call and proceed
+                self.last_call_time = time.time()
+                return
+
+    def read_rate_limit_headers(self, header_file_path):
+        """Parse Qualys rate-limit headers and adjust throttling.
+
+        Called after every API response. If remaining calls are low,
+        we slow down. If exhausted, we pause all threads.
+        """
         if not os.path.exists(header_file_path):
             return
 
@@ -328,37 +448,42 @@ class GlobalRateLimiter:
 
         try:
             for line in open(header_file_path):
-                header_lower = line.lower().strip()
-                if header_lower.startswith("x-ratelimit-remaining:"):
+                lower_line = line.lower().strip()
+                if lower_line.startswith("x-ratelimit-remaining:"):
                     remaining = int(line.split(":", 1)[1].strip())
-                elif header_lower.startswith("x-ratelimit-window-sec:"):
+                elif lower_line.startswith("x-ratelimit-window-sec:"):
                     window_seconds = int(line.split(":", 1)[1].strip())
-                elif header_lower.startswith("x-ratelimit-limit:"):
-                    self.api_limit = int(line.split(":", 1)[1].strip())
         except (ValueError, IOError):
             return
 
-        with self._lock:
+        with self.lock:
             if remaining is not None:
-                self.api_remaining = remaining
+                self.last_known_remaining = remaining
             if window_seconds is not None:
-                self.api_window_seconds = window_seconds
+                self.last_known_window = window_seconds
 
-            if remaining is not None:
-                if remaining <= 0:
-                    # Rate limit exhausted — pause ALL threads
-                    pause_duration = (window_seconds or 60) + 5
-                    self._global_pause_until = time.time() + pause_duration
-                    self.logger.warning(f"  Rate limit exhausted (0 remaining) — all threads pausing {pause_duration}s")
-                    self.total_throttle_events += 1
-                    self.total_throttle_seconds += pause_duration
-                elif remaining <= 20:
-                    # Getting low — slow down to 1 call/sec
-                    self.minimum_interval = max(self.minimum_interval, 1.0)
-                    self.logger.debug(f"  Rate limit low ({remaining}) — slowed to 1/sec")
+            if remaining is not None and remaining <= 0:
+                # Rate limit exhausted — pause ALL threads
+                pause_duration = (window_seconds or 60) + 5
+                self.global_pause_until = time.time() + pause_duration
+                self.logger.warning(
+                    f"  Rate limit exhausted (0 remaining) — "
+                    f"ALL threads pausing {pause_duration}s"
+                )
+                self.total_throttle_events += 1
+                self.total_throttle_seconds += pause_duration
+
+            elif remaining is not None and remaining <= 20:
+                # Getting low — slow down to 1 call per second
+                self.minimum_interval = max(self.minimum_interval, 1.0)
+                self.logger.debug(f"  Rate limit low ({remaining} left) — slowing down")
 
     def handle_http_429(self, header_file_path):
-        """When HTTP 429 is received, pause ALL threads."""
+        """Handle HTTP 429 (Too Many Requests) — pause ALL threads.
+
+        If the response includes a Retry-After header, wait that long.
+        Otherwise, wait for the rate limit window to reset.
+        """
         retry_after = None
         if os.path.exists(header_file_path):
             try:
@@ -368,29 +493,38 @@ class GlobalRateLimiter:
             except (ValueError, IOError):
                 pass
 
-        pause_duration = retry_after or (self.api_window_seconds or 30) + 5
-        with self._lock:
-            self._global_pause_until = time.time() + pause_duration
-            self.logger.warning(f"  HTTP 429 received — all threads pausing {pause_duration}s")
+        pause_duration = retry_after or (self.last_known_window or 30) + 5
+
+        with self.lock:
+            self.global_pause_until = time.time() + pause_duration
+            self.logger.warning(f"  HTTP 429 — ALL threads pausing {pause_duration}s")
             self.total_throttle_events += 1
             self.total_throttle_seconds += pause_duration
 
 
-# ============================================================================
-# API Client — handles all HTTP calls to Qualys CSAPI
-#
-# Thread-safe: can be shared across parallel threads.
-# Key: HTTP 204 = valid "no content" response (0 containers), NOT an error.
-# ============================================================================
-class QualysAPIClient:
-    def __init__(self, gateway, token, max_retries, connect_timeout,
-                 request_timeout, curl_extra_args, rate_limiter, logger):
-        self.gateway = gateway.rstrip("/")
-        self.token = token
+# =============================================================================
+# API CLIENT — makes HTTP requests to Qualys with retry and rate-limiting
+# =============================================================================
+
+class QualysApiClient:
+    """Handles all communication with the Qualys CSAPI.
+
+    Features:
+    - Retries failed requests with exponential backoff + jitter
+    - Treats HTTP 204 as success (zero containers — not an error!)
+    - Coordinates with GlobalRateLimiter for thread-safe rate limiting
+    - Thread-safe counters for metrics
+    """
+
+    def __init__(self, gateway_url, access_token, max_retries,
+                 connect_timeout, request_timeout, extra_curl_args,
+                 rate_limiter, logger):
+        self.gateway = gateway_url.rstrip("/")
+        self.token = access_token
         self.max_retries = max_retries
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
-        self.curl_extra_args = curl_extra_args
+        self.extra_curl_args = extra_curl_args
         self.rate_limiter = rate_limiter
         self.logger = logger
 
@@ -400,6 +534,7 @@ class QualysAPIClient:
         self._total_retries = 0
         self._total_errors = 0
 
+    # --- Thread-safe metric accessors ---
     @property
     def total_api_calls(self):
         with self._counter_lock:
@@ -421,49 +556,67 @@ class QualysAPIClient:
             self._total_retries += retries
             self._total_errors += errors
 
-    def make_request(self, url, output_file, keep_header_file=False):
-        """Make a GET request with retry logic. Returns the HTTP status code.
+    def _calculate_retry_delay(self, attempt_number):
+        """Exponential backoff with jitter: random(1, min(15, 2^attempt)).
 
-        Return values:
-          200 = success, response body in output_file
-          204 = success, no content (e.g. 0 running containers)
-          0   = all retries failed
-
-        Retry policy:
-          - 429 (rate limited): wait per Retry-After, then retry
-          - 5xx (server error): short backoff, retry
-          - Connection failure: short backoff, retry
-          - 401/403/404: FATAL — exit immediately (no retry)
+        Why jitter? If 5 threads all fail at the same time and retry
+        after exactly 4 seconds, they'll all collide again. Random jitter
+        spreads them out.
         """
-        for attempt_number in range(self.max_retries + 1):
-            _exit_if_shutdown()
+        max_delay = min(15, 2 ** attempt_number)
+        return random.uniform(1, max_delay)
 
-            # Wait before retries (not on first attempt)
-            if attempt_number > 0:
-                backoff_seconds = random.uniform(1, min(15, 2 ** attempt_number))
-                self.logger.debug(f"  Retry {attempt_number}/{self.max_retries} in {backoff_seconds:.0f}s")
-                time.sleep(backoff_seconds)
+    def make_request(self, url, output_file_path, keep_headers=False):
+        """Make a GET request to the Qualys API.
+
+        Args:
+            url: Full API URL
+            output_file_path: Where to save the response body
+            keep_headers: If True, keep the .hdr file (needed for pagination)
+
+        Returns:
+            HTTP status code: 200 (success), 204 (no content), or 0 (all retries failed)
+
+        HTTP status handling:
+            200 → Success, response body saved to output_file_path
+            204 → Success, no content (e.g. zero running containers)
+            401 → Token expired — script exits immediately
+            403 → No permission — script exits immediately
+            404 → URL not found — script exits immediately
+            429 → Rate limited — wait and retry
+            5xx → Server error — retry with backoff
+            0   → Connection failed — retry with backoff
+        """
+        for attempt in range(self.max_retries + 1):
+            check_if_shutdown_requested()
+
+            # Wait before retry (not on first attempt)
+            if attempt > 0:
+                delay = self._calculate_retry_delay(attempt)
+                self.logger.debug(f"  Retry {attempt}/{self.max_retries} in {delay:.0f}s")
+                time.sleep(delay)
                 self._increment_counters(retries=1)
 
-            # Wait for rate-limit token before making the call
+            # Wait for rate limiter approval before making the call
             self.rate_limiter.acquire()
 
-            # Execute curl
-            header_file = output_file + ".hdr"
+            # Build the curl command
+            header_file = output_file_path + ".hdr"
             curl_command = [
-                "curl", "-s",
-                "-o", output_file,            # save response body here
-                "-D", header_file,            # save response headers here
-                "-w", "%{http_code}",         # print HTTP code to stdout
+                "curl", "-s",                             # silent mode
+                "-o", output_file_path,                   # save response body here
+                "-D", header_file,                        # save response headers here
+                "-w", "%{http_code}",                     # print HTTP status to stdout
                 "--connect-timeout", str(self.connect_timeout),
                 "--max-time", str(self.request_timeout),
                 "-X", "GET", url,
                 "-H", "Accept: application/json",
                 "-H", f"Authorization: Bearer {self.token}",
             ]
-            if self.curl_extra_args:
-                curl_command.extend(self.curl_extra_args.split())
+            if self.extra_curl_args:
+                curl_command.extend(self.extra_curl_args.split())
 
+            # Execute curl
             try:
                 result = subprocess.run(curl_command, capture_output=True, text=True)
                 http_code = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
@@ -473,129 +626,156 @@ class QualysAPIClient:
                 continue
 
             self._increment_counters(calls=1)
+            self.rate_limiter.read_rate_limit_headers(header_file)
 
-            # Always read rate-limit headers (even on errors)
-            self.rate_limiter.update_from_response_headers(header_file)
-
-            # --- Handle response ---
-
-            # SUCCESS: 200 = data returned, 204 = no content (valid)
+            # Handle the response
             if http_code in (200, 204):
-                if not keep_header_file:
-                    remove_file(header_file)
+                # Success! Clean up headers unless caller needs them
+                if not keep_headers:
+                    remove_file_silently(header_file)
                 return http_code
 
-            # FATAL errors — exit immediately, no retry
             if http_code == 401:
-                self.logger.error("HTTP 401 — token expired or invalid")
-                sys.exit(1)
-            if http_code == 403:
-                self.logger.error("HTTP 403 — insufficient permissions")
-                sys.exit(1)
-            if http_code == 404:
-                self.logger.error(f"HTTP 404 — endpoint not found: {url}")
+                self.logger.error("HTTP 401 — Access token expired or invalid.")
+                self.logger.error("Generate a new token: Qualys CS → Configurations → Access Token")
                 sys.exit(1)
 
-            # RETRYABLE errors
+            if http_code == 403:
+                self.logger.error("HTTP 403 — Insufficient permissions. Check token scope.")
+                sys.exit(1)
+
+            if http_code == 404:
+                self.logger.error(f"HTTP 404 — Endpoint not found: {url}")
+                self.logger.error("Check your gateway URL and API version.")
+                sys.exit(1)
+
             if http_code == 429:
                 self.rate_limiter.handle_http_429(header_file)
+            else:
+                self.logger.debug(f"  HTTP {http_code}")
 
-            remove_file(header_file)
+            remove_file_silently(header_file)
             self._increment_counters(errors=1)
 
         # All retries exhausted
         return 0
 
     def fetch_all_pages(self, initial_url, pages_directory, label, page_size):
-        """Fetch ALL pages from a paginated Qualys API endpoint.
+        """Fetch all pages from a paginated Qualys API endpoint.
 
-        Qualys uses the Link header for pagination:
-          Link: <next_page_url>;rel=next
+        Qualys uses the HTTP Link header for pagination:
+            Link: <https://...?page=2>;rel=next
 
-        Resume logic:
-          - Cached page + .hdr with Link → skip to next page
-          - Cached partial page (< page_size) → last page, done
-          - Cached full page but .hdr missing → re-fetch to recover Link
+        When there's no Link header, we've reached the last page.
+
+        For crash-safe resume:
+        - Each page is saved to disk
+        - The .hdr file (containing the Link to next page) is kept until
+          the NEXT page is saved
+        - If .hdr is lost (crash between pages), the page is re-fetched
+
+        Args:
+            initial_url: First page URL
+            pages_directory: Where to save per-page JSON files
+            label: Label for log messages (e.g. "img", "eol")
+            page_size: The --limit value (used to detect last page)
+
+        Returns:
+            List of all records across all pages
         """
         all_records = []
-        page_number = 1
+        current_page = 1
         current_url = initial_url
 
         while current_url:
-            _exit_if_shutdown()
+            check_if_shutdown_requested()
 
-            page_file = os.path.join(pages_directory, f"{label}_{page_number:04d}.json")
+            page_file = os.path.join(pages_directory, f"{label}_{current_page:04d}.json")
             header_file = page_file + ".hdr"
 
-            # --- Try to reuse cached page ---
+            # ── Try to reuse a previously cached page ──
             if os.path.exists(page_file):
                 try:
                     page_data = json.load(open(page_file)).get("data", [])
                 except (json.JSONDecodeError, KeyError, TypeError):
-                    page_data = None  # corrupted — re-fetch below
+                    page_data = None  # corrupted — re-fetch
 
                 if isinstance(page_data, list) and len(page_data) > 0:
-                    next_page_url = self._extract_next_url(header_file)
+                    next_page_url = self._extract_next_page_url(header_file)
 
                     if next_page_url:
-                        # Cached page with Link header → use it
+                        # Have cached page + Link header → use it
                         all_records.extend(page_data)
-                        self.logger.info(f"  {label} p{page_number}: {len(page_data)} (cached)")
+                        self.logger.info(f"  {label} page {current_page}: {len(page_data)} records (cached)")
                         current_url = next_page_url
-                        page_number += 1
+                        current_page += 1
                         continue
-                    elif len(page_data) < page_size:
-                        # Partial page = last page
-                        all_records.extend(page_data)
-                        self.logger.info(f"  {label} p{page_number}: {len(page_data)} (cached, last)")
-                        break
-                    else:
-                        # Full page but .hdr lost — must re-fetch
-                        self.logger.info(f"  {label} p{page_number}: cached but Link lost — re-fetching")
 
-            # --- Fresh fetch ---
-            self.logger.info(f"  Fetching {label} page {page_number}...")
-            http_code = self.make_request(current_url, page_file, keep_header_file=True)
+                    elif len(page_data) < page_size:
+                        # Cached partial page = last page
+                        all_records.extend(page_data)
+                        self.logger.info(f"  {label} page {current_page}: {len(page_data)} records (cached, last page)")
+                        break
+
+                    else:
+                        # Full page but .hdr is missing → re-fetch to recover Link
+                        self.logger.info(f"  {label} page {current_page}: cached but Link header lost — re-fetching")
+
+            # ── Fresh fetch from API ──
+            self.logger.info(f"  Fetching {label} page {current_page}...")
+            http_code = self.make_request(current_url, page_file, keep_headers=True)
 
             if http_code != 200:
-                self.logger.error(f"  Failed on {label} page {page_number} (HTTP {http_code})")
+                self.logger.error(f"  Failed on {label} page {current_page} (HTTP {http_code})")
                 break
 
             # Parse response
             try:
                 page_data = json.load(open(page_file)).get("data", [])
             except (json.JSONDecodeError, KeyError, TypeError):
-                self.logger.warning(f"  Bad JSON on {label} page {page_number}")
+                self.logger.warning(f"  Bad JSON on {label} page {current_page}")
                 break
+
             if not isinstance(page_data, list):
-                self.logger.warning(f"  Invalid data on {label} page {page_number}")
+                self.logger.warning(f"  Invalid response on {label} page {current_page}")
                 break
 
             all_records.extend(page_data)
-            self.logger.info(f"  {label} p{page_number}: {len(page_data)} (total: {len(all_records)})")
+            self.logger.info(
+                f"  {label} page {current_page}: {len(page_data)} records "
+                f"(total: {len(all_records)})"
+            )
 
-            # --- Determine next page ---
-            next_page_url = self._extract_next_url(header_file)
+            # ── Check for next page ──
+            next_page_url = self._extract_next_page_url(header_file)
+
             if next_page_url:
-                # Clean up PREVIOUS page's .hdr (current one stays for resume)
-                if page_number > 1:
-                    previous_header = os.path.join(pages_directory, f"{label}_{page_number-1:04d}.json.hdr")
-                    remove_file(previous_header)
+                # Clean up PREVIOUS page's header (current page's stays for resume)
+                if current_page > 1:
+                    prev_header = os.path.join(
+                        pages_directory, f"{label}_{current_page - 1:04d}.json.hdr"
+                    )
+                    remove_file_silently(prev_header)
                 current_url = next_page_url
-                page_number += 1
+                current_page += 1
             else:
                 # No Link header = last page
-                remove_file(header_file)
+                remove_file_silently(header_file)
                 break
 
-        # Clean up final .hdr
-        remove_file(os.path.join(pages_directory, f"{label}_{page_number:04d}.json.hdr"))
-        self.logger.info(f"  {label}: {len(all_records)} records total, {page_number} pages")
+        # Clean up last page's header
+        remove_file_silently(
+            os.path.join(pages_directory, f"{label}_{current_page:04d}.json.hdr")
+        )
+        self.logger.info(f"  {label}: {len(all_records)} total across {current_page} pages")
         return all_records
 
     @staticmethod
-    def _extract_next_url(header_file_path):
-        """Extract next page URL from the Link response header."""
+    def _extract_next_page_url(header_file_path):
+        """Extract the next page URL from the HTTP Link header.
+
+        Qualys format: Link: <https://gateway.../images/list?page=2>;rel=next
+        """
         if not os.path.exists(header_file_path):
             return ""
         try:
@@ -609,262 +789,293 @@ class QualysAPIClient:
         return ""
 
 
-# ============================================================================
-# Phase 3: Parallel Container Count Fetcher
-# ============================================================================
+# =============================================================================
+# PHASE 3: PARALLEL CONTAINER COUNT FETCHER
+# =============================================================================
+
 def fetch_container_counts_parallel(
     api_client, base_api_url, image_shas, container_scan_days,
     existing_counts, raw_directory, thread_count, logger
 ):
     """Fetch running container count for each image SHA using parallel threads.
 
-    Key behaviors:
-      - HTTP 200 = containers found, parse count from response JSON
-      - HTTP 204 = zero running containers (valid, NOT an error)
-      - Any other code = count as 0, move on (don't block the whole run)
-      - All threads share the global rate limiter
-      - Checkpoints to disk every 100 SHAs for crash recovery
+    For each SHA, calls:
+        GET /containers?filter=state:RUNNING AND imageSha:<SHA>
+            AND lastVmScanDate:[now-3d...now]
+
+    Response codes:
+        200 → Parse JSON for container count
+        204 → Zero running containers (valid, NOT an error)
+        Other → Count as 0 and move on
+
+    Thread safety:
+        - All threads go through the GlobalRateLimiter before each call
+        - Counts are saved to a shared dict with a lock
+        - Progress is checkpointed to disk every 100 SHAs
+
+    Args:
+        existing_counts: Dict of already-fetched counts (for resume)
     """
-    # Filter out already-fetched SHAs (resume support)
+    # Figure out which SHAs still need fetching
     shas_to_fetch = [sha for sha in image_shas if sha not in existing_counts]
+
     if not shas_to_fetch:
-        logger.info(f"  All {len(image_shas)} SHAs already cached")
+        logger.info(f"  All {len(image_shas)} image SHAs already cached")
         return existing_counts
 
-    total_to_fetch = len(shas_to_fetch)
-    logger.info(f"  {total_to_fetch} to fetch, {len(existing_counts)} cached — {thread_count} threads")
+    logger.info(
+        f"  {len(shas_to_fetch)} to fetch, {len(existing_counts)} already cached "
+        f"— using {thread_count} threads"
+    )
 
-    counts_file_path = os.path.join(raw_directory, "container_counts.json")
+    counts_file = os.path.join(raw_directory, "container_counts.json")
     completed_count = 0
-    progress_lock = threading.Lock()
+    counter_lock = threading.Lock()
     start_time = time.time()
 
-    def _fetch_single_sha(image_sha):
-        """Fetch container count for one SHA. Called by each thread."""
+    def fetch_single_sha(sha):
+        """Fetch container count for one SHA. Runs in a thread."""
         nonlocal completed_count
 
         container_api_url = (
             f"{base_api_url}/containers"
-            f"?filter=state%3A%20%60RUNNING%60%20and%20imageSha%3A{image_sha}"
+            f"?filter=state%3A%20%60RUNNING%60%20and%20imageSha%3A{sha}"
             f"%20and%20lastVmScanDate%3A%5Bnow-{container_scan_days}d%20...%20now%5D"
         )
 
-        # Use thread ID in temp filename to avoid collisions between threads
-        thread_id = threading.current_thread().ident
-        temp_file = os.path.join(raw_directory, f"_tmp_{image_sha[:12]}_{thread_id}.json")
+        # Use SHA prefix + thread ID for temp file (avoids collisions)
+        temp_file = os.path.join(
+            raw_directory,
+            f"_cc_{sha[:12]}_{threading.current_thread().ident}.json"
+        )
 
         http_code = api_client.make_request(container_api_url, temp_file)
-
         container_count = 0
+
         if http_code == 200:
-            # 200 = containers found — parse the count
+            # Response has data — parse the count
             try:
                 response_data = json.load(open(temp_file))
                 container_count = response_data.get("count", len(response_data.get("data", [])))
             except Exception:
                 pass
-        # 204 = no running containers (count stays 0)
-        # 0 or other = API call failed (count stays 0, move on)
+        # http_code == 204 means zero containers (count stays 0)
+        # http_code == 0 means request failed (count stays 0)
 
-        remove_file(temp_file)
+        remove_file_silently(temp_file)
 
-        # Update shared state (thread-safe)
-        with progress_lock:
-            existing_counts[image_sha] = container_count
+        # Thread-safe update
+        with counter_lock:
+            existing_counts[sha] = container_count
             completed_count += 1
 
-            # Log progress every 50 SHAs
-            if completed_count % 50 == 0 or completed_count == 1 or completed_count == total_to_fetch:
+            # Progress log every 50 SHAs
+            if completed_count % 50 == 0 or completed_count == 1 or completed_count == len(shas_to_fetch):
                 elapsed = time.time() - start_time
                 rate = elapsed / completed_count if completed_count > 0 else 1
-                estimated_remaining = format_duration(int((total_to_fetch - completed_count) * rate))
-                logger.info(f"  Containers: {completed_count}/{total_to_fetch} ({estimated_remaining} remaining)")
+                remaining_time = format_duration(int((len(shas_to_fetch) - completed_count) * rate))
+                logger.info(
+                    f"  Container counts: {completed_count}/{len(shas_to_fetch)} "
+                    f"({remaining_time} remaining)"
+                )
 
-            # Checkpoint every 100 SHAs
+            # Checkpoint to disk every 100 SHAs
             if completed_count % 100 == 0:
-                write_json_atomically(counts_file_path, existing_counts)
+                write_json_atomically(counts_file, existing_counts)
 
-    # Run threads
-    with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-        futures = {executor.submit(_fetch_single_sha, sha): sha for sha in shas_to_fetch}
-        for future in concurrent.futures.as_completed(futures):
-            _exit_if_shutdown()
+    # Run all fetches in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as pool:
+        future_to_sha = {pool.submit(fetch_single_sha, sha): sha for sha in shas_to_fetch}
+        for future in concurrent.futures.as_completed(future_to_sha):
+            check_if_shutdown_requested()
             try:
                 future.result()
             except Exception as error:
                 logger.debug(f"  Thread error: {error}")
 
     # Final save
-    write_json_atomically(counts_file_path, existing_counts)
-    elapsed_total = int(time.time() - start_time)
-    logger.info(f"  Done: {total_to_fetch} fetched in {format_duration(elapsed_total)}")
+    write_json_atomically(counts_file, existing_counts)
+    total_time = format_duration(int(time.time() - start_time))
+    logger.info(f"  Done: {len(shas_to_fetch)} fetched in {total_time}")
+
     return existing_counts
 
 
-# ============================================================================
-# Data Processing — transform raw API data into report-ready format
-# ============================================================================
-def extract_image_repositories(raw_image):
-    """Extract all (registry, repository, tag) from an image record.
-    Falls back to repoDigests for registry when repo.registry is null.
-    Returns at least one entry so the image always gets a CSV row."""
-    repo_list = raw_image.get("repo") or []
-    digest_list = raw_image.get("repoDigests") or []
+# =============================================================================
+# DATA PROCESSING — transform raw API data into report-ready structures
+# =============================================================================
 
-    # Build fallback: repository_name → registry from repoDigests
-    registry_fallback = {
-        digest["repository"]: digest["registry"]
-        for digest in digest_list
-        if digest.get("registry") and digest.get("repository")
-    }
+def extract_image_repositories(image_data):
+    """Extract all (registry, repository, tag) entries from an image.
+
+    Some images are pushed to multiple registries (e.g. both docker.io and ECR).
+    Each registry/repo/tag gets its own row in the CSV.
+
+    If registry is null in the repo list, we try to find it from repoDigests
+    (a secondary field that sometimes has the registry).
+    """
+    repo_entries = image_data.get("repo") or []
+    digest_entries = image_data.get("repoDigests") or []
+
+    # Build a fallback lookup: repository name → registry from repoDigests
+    registry_fallback = {}
+    for digest in digest_entries:
+        if digest.get("registry") and digest.get("repository"):
+            registry_fallback[digest["repository"]] = digest["registry"]
 
     result = []
-    for repo_entry in repo_list:
-        registry = repo_entry.get("registry")
-        repository = safe_string(repo_entry.get("repository"))
-        tag = safe_string(repo_entry.get("tag"))
+    for repo in repo_entries:
+        registry = repo.get("registry")
+        repository = convert_to_safe_string(repo.get("repository"))
+        tag = convert_to_safe_string(repo.get("tag"))
 
-        # If registry is null, try to find it from repoDigests
+        # If registry is null, try the fallback from repoDigests
         if not registry and repository:
             registry = registry_fallback.get(repository, "")
 
         result.append({
-            "registry": safe_string(registry),
+            "registry": convert_to_safe_string(registry),
             "repository": repository,
             "tag": tag,
         })
 
-    # If no repos at all, return one empty entry
-    return result or [{"registry": "", "repository": "", "tag": ""}]
+    # If no repos at all, return one empty entry so the image still gets a row
+    return result if result else [{"registry": "", "repository": "", "tag": ""}]
 
 
-def build_enriched_image_list(raw_images, eol_image_shas, container_counts, skip_containers):
-    """Transform raw Qualys API records into enriched report records.
+def build_enriched_image_list(raw_images, eol_sha_set, container_counts, skip_containers):
+    """Transform raw Qualys API records into enriched records for the report.
 
-    Key logic for EOL_Base_OS:
-      - If the image has an Operating System AND its SHA was returned by
-        the EOL API call → True
-      - If the image has an Operating System but SHA was NOT in EOL response → False
-      - If the image has NO Operating System → blank (we can't determine EOL)
+    Each enriched record contains:
+    - All image metadata (ID, SHA, OS, architecture, dates, etc.)
+    - EOL flag (True if SHA was returned by the EOL-filtered API call)
+    - Container count (from Container API, or "N/A" if skipped)
+    - Full software and vulnerability lists (for CSV row generation)
     """
-    enriched_list = []
+    enriched = []
 
-    for raw_image in raw_images:
-        image_sha = raw_image.get("sha", "")
-        operating_system = safe_string(raw_image.get("operatingSystem"))
-        vulnerabilities = raw_image.get("vulnerabilities") or []
-        software_list = raw_image.get("softwares") or []
+    for image in raw_images:
+        image_sha = image.get("sha", "")
+        vulnerabilities = image.get("vulnerabilities") or []
+        softwares = image.get("softwares") or []
 
-        # EOL logic: blank OS → blank EOL (can't determine)
-        if operating_system:
-            is_eol_base_os = image_sha in eol_image_shas
-        else:
-            is_eol_base_os = ""  # blank — unknown OS means unknown EOL
-
-        # Container count
-        if skip_containers:
-            running_containers = "N/A"
-        else:
-            running_containers = container_counts.get(image_sha, 0)
-
-        enriched_list.append({
-            "image_id":           safe_string(raw_image.get("imageId")),
+        enriched.append({
+            "image_id":           convert_to_safe_string(image.get("imageId")),
             "image_sha":          image_sha,
-            "operating_system":   operating_system,
-            "eol_base_os":        is_eol_base_os,
-            "architecture":       safe_string(raw_image.get("architecture")),
-            "image_created":      epoch_milliseconds_to_iso(raw_image.get("created")),
-            "image_last_scanned": epoch_milliseconds_to_iso(raw_image.get("lastScanned")),
-            "image_scan_types":   raw_image.get("scanTypes") or [],
-            "repositories":       extract_image_repositories(raw_image),
-            "risk_score":         raw_image.get("riskScore"),
-            "max_qds_score":      raw_image.get("maxQdsScore"),
-            "qds_severity":       safe_string(raw_image.get("qdsSeverity")),
+            "operating_system":   convert_to_safe_string(image.get("operatingSystem")),
+            "eol_base_os":        image_sha in eol_sha_set,
+            "architecture":       convert_to_safe_string(image.get("architecture")),
+            "created":            convert_epoch_ms_to_iso(image.get("created")),
+            "last_scanned":       convert_epoch_ms_to_iso(image.get("lastScanned")),
+            "scan_types":         image.get("scanTypes") or [],
+            "source":             image.get("source") or [],
+            "repositories":       extract_image_repositories(image),
+            "risk_score":         image.get("riskScore"),
+            "qds_score":          image.get("maxQdsScore"),
+            "qds_severity":       convert_to_safe_string(image.get("qdsSeverity")),
             "vulnerability_count": len(vulnerabilities),
-            "running_containers": running_containers,
+            "container_count":    container_counts.get(image_sha, "N/A") if not skip_containers else "N/A",
             "vulnerabilities":    vulnerabilities,
-            "software_list":      software_list,
+            "softwares":          softwares,
         })
 
-    return enriched_list
+    return enriched
 
 
-# ============================================================================
-# CSV Report — 28 columns, fully denormalized
-# ============================================================================
+# =============================================================================
+# CSV REPORT — 31 columns, fully denormalized
+#
+# The CSV has one row per (image × repo × vulnerability/software).
+# This means image-level data is repeated, but you can filter in Excel
+# by any column without needing pivot tables or VLOOKUPs.
+#
+# Row generation (for each image × each registry/repo/tag):
+#   Pass 1: One row per vulnerability × affected software
+#   Pass 2: One row per installed software NOT covered by a vulnerability
+#   Pass 3: One row for bare images (no software, no vulns)
+# =============================================================================
+
 CSV_HEADERS = [
-    # Image columns (16)
+    # Image columns (17)
     "Image_ID", "Image_SHA", "Operating_System", "EOL_Base_OS", "Architecture",
-    "Image_Created", "Image_Last_Scanned", "Image_Scan_Types",
+    "Image_Created", "Image_Last_Scanned", "Image_Scan_Types", "Image_Source",
     "Registry", "Repository", "Image_Tag",
     "Risk_Score", "Max_QDS_Score", "QDS_Severity",
     "Total_Vulnerabilities_On_Image", "Running_Container_Count",
-    # Software columns (5)
+
+    # Software columns (7)
     "Software_Name", "Software_Installed_Version", "Software_Fix_Version",
-    "Software_Lifecycle_Stage", "Software_EOL_Date",
+    "Software_Lifecycle_Stage", "Software_GA_Date", "Software_EOL_Date", "Software_EOS_Date",
+
     # Vulnerability columns (7)
     "Vuln_QID", "Vuln_Scan_Type", "Vuln_Type_Detected", "Vuln_First_Found",
     "Vuln_Affected_Software_Name", "Vuln_Affected_Software_Version", "Vuln_Fix_Version",
 ]
 
-IMAGE_COLUMN_COUNT = 16
-SOFTWARE_COLUMN_COUNT = 5
-VULN_COLUMN_COUNT = 7
-EMPTY_SOFTWARE_COLUMNS = [""] * SOFTWARE_COLUMN_COUNT
-EMPTY_VULN_COLUMNS = [""] * VULN_COLUMN_COUNT
+IMAGE_COLUMN_COUNT    = 17
+SOFTWARE_COLUMN_COUNT = 7
+VULN_COLUMN_COUNT     = 7
+EMPTY_SOFTWARE_COLS   = [""] * SOFTWARE_COLUMN_COUNT
+EMPTY_VULN_COLS       = [""] * VULN_COLUMN_COUNT
 
 
-def _build_image_columns(image, repo_entry):
-    """Build the 16 image-level columns for one CSV row."""
+def build_image_columns(image, repo):
+    """Build the 17 image-level columns for one CSV row."""
     return [
         image["image_id"],
         image["image_sha"],
         image["operating_system"],
         image["eol_base_os"],
         image["architecture"],
-        image["image_created"],
-        image["image_last_scanned"],
-        " | ".join(safe_string(scan_type) for scan_type in image["image_scan_types"]),
-        repo_entry["registry"],
-        repo_entry["repository"],
-        repo_entry["tag"],
-        safe_string(image["risk_score"]),
-        safe_string(image["max_qds_score"]),
+        image["created"],
+        image["last_scanned"],
+        " | ".join(convert_to_safe_string(s) for s in image["scan_types"]),
+        " | ".join(convert_to_safe_string(s) for s in image["source"]),
+        repo["registry"],
+        repo["repository"],
+        repo["tag"],
+        convert_to_safe_string(image["risk_score"]),
+        convert_to_safe_string(image["qds_score"]),
         image["qds_severity"],
         image["vulnerability_count"],
-        image["running_containers"],
+        image["container_count"],
     ]
 
 
-def _build_software_columns(software_entry):
-    """Build the 5 software-level columns for one CSV row."""
-    lifecycle = software_entry.get("lifecycle") or {}
+def build_software_columns(software):
+    """Build the 7 software-level columns for one CSV row."""
+    lifecycle = software.get("lifecycle") or {}
     return [
-        safe_string(software_entry.get("name")),
-        safe_string(software_entry.get("version")),
-        safe_string(software_entry.get("fixVersion")),
-        safe_string(lifecycle.get("stage")),
-        epoch_milliseconds_to_iso(lifecycle.get("eolDate")),
+        convert_to_safe_string(software.get("name")),
+        convert_to_safe_string(software.get("version")),
+        convert_to_safe_string(software.get("fixVersion")),
+        convert_to_safe_string(lifecycle.get("stage")),
+        convert_epoch_ms_to_iso(lifecycle.get("gaDate")),
+        convert_epoch_ms_to_iso(lifecycle.get("eolDate")),
+        convert_epoch_ms_to_iso(lifecycle.get("eosDate")),
     ]
 
 
-def _build_vulnerability_columns(vulnerability, affected_software):
+def build_vulnerability_columns(vulnerability, affected_software):
     """Build the 7 vulnerability-level columns for one CSV row."""
     return [
-        safe_string(vulnerability.get("qid")),
-        " | ".join(safe_string(st) for st in (vulnerability.get("scanType") or [])),
-        safe_string(vulnerability.get("typeDetected")),
-        epoch_milliseconds_to_iso(vulnerability.get("firstFound")),
-        safe_string(affected_software.get("name")),
-        safe_string(affected_software.get("version")),
-        safe_string(affected_software.get("fixVersion")),
+        convert_to_safe_string(vulnerability.get("qid")),
+        " | ".join(convert_to_safe_string(s) for s in (vulnerability.get("scanType") or [])),
+        convert_to_safe_string(vulnerability.get("typeDetected")),
+        convert_epoch_ms_to_iso(vulnerability.get("firstFound")),
+        convert_to_safe_string(affected_software.get("name")),
+        convert_to_safe_string(affected_software.get("version")),
+        convert_to_safe_string(affected_software.get("fixVersion")),
     ]
 
 
 def generate_csv_report(enriched_images, output_path, logger):
-    """Write the unified CSV report. Atomic write (temp → rename)."""
+    """Write the unified CSV report. Uses atomic write (temp → rename).
+
+    Returns the total number of data rows written.
+    """
     temp_path = output_path + ".tmp"
-    row_count = 0
+    total_rows = 0
 
     with open(temp_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -872,58 +1083,61 @@ def generate_csv_report(enriched_images, output_path, logger):
 
         for image in enriched_images:
             # Build software lookup ONCE per image (not per repo)
-            software_lookup = {
-                (safe_string(sw.get("name")), safe_string(sw.get("version"))): sw
-                for sw in image["software_list"]
-            }
+            software_by_name_version = {}
+            for sw in image["softwares"]:
+                key = (convert_to_safe_string(sw.get("name")),
+                       convert_to_safe_string(sw.get("version")))
+                software_by_name_version[key] = sw
 
-            # Each repo gets its own set of rows (no pipe-delimited values)
-            for repo_entry in image["repositories"]:
-                image_columns = _build_image_columns(image, repo_entry)
-                assert len(image_columns) == IMAGE_COLUMN_COUNT
+            # Each registry/repo/tag gets its own set of rows
+            for repo in image["repositories"]:
+                image_cols = build_image_columns(image, repo)
+                assert len(image_cols) == IMAGE_COLUMN_COUNT
 
-                software_already_written = set()
+                # Track which softwares were already written via vulnerability rows
+                softwares_written_via_vulns = set()
 
-                # Pass 1: Vulnerability rows (primary)
-                for vulnerability in image["vulnerabilities"]:
-                    affected_software_list = vulnerability.get("software") or [{}]
-                    for affected_sw in affected_software_list:
-                        sw_key = (safe_string(affected_sw.get("name")),
-                                  safe_string(affected_sw.get("version")))
+                # PASS 1: Vulnerability rows
+                for vuln in image["vulnerabilities"]:
+                    affected_softwares = vuln.get("software") or [{}]
+                    for affected_sw in affected_softwares:
+                        sw_key = (convert_to_safe_string(affected_sw.get("name")),
+                                  convert_to_safe_string(affected_sw.get("version")))
 
-                        # Try to match vuln's software → installed software
-                        matched_software = software_lookup.get(sw_key)
-                        software_columns = _build_software_columns(matched_software) if matched_software else EMPTY_SOFTWARE_COLUMNS
-                        vuln_columns = _build_vulnerability_columns(vulnerability, affected_sw)
+                        # Try to match vuln's affected software to installed software
+                        matched_software = software_by_name_version.get(sw_key)
+                        sw_cols = build_software_columns(matched_software) if matched_software else EMPTY_SOFTWARE_COLS
+                        vuln_cols = build_vulnerability_columns(vuln, affected_sw)
 
-                        row = image_columns + software_columns + vuln_columns
+                        row = image_cols + sw_cols + vuln_cols
                         assert len(row) == len(CSV_HEADERS)
                         writer.writerow(row)
-                        row_count += 1
+                        total_rows += 1
 
                         if matched_software:
-                            software_already_written.add(sw_key)
+                            softwares_written_via_vulns.add(sw_key)
 
-                # Pass 2: Software-only rows (not covered by vulnerabilities)
-                for software in image["software_list"]:
-                    sw_key = (safe_string(software.get("name")),
-                              safe_string(software.get("version")))
-                    if sw_key not in software_already_written:
-                        row = image_columns + _build_software_columns(software) + EMPTY_VULN_COLUMNS
+                # PASS 2: Software-only rows (not covered by vulns)
+                for sw in image["softwares"]:
+                    sw_key = (convert_to_safe_string(sw.get("name")),
+                              convert_to_safe_string(sw.get("version")))
+                    if sw_key not in softwares_written_via_vulns:
+                        row = image_cols + build_software_columns(sw) + EMPTY_VULN_COLS
                         assert len(row) == len(CSV_HEADERS)
                         writer.writerow(row)
-                        row_count += 1
+                        total_rows += 1
 
-                # Pass 3: Bare image (no software, no vulnerabilities)
-                if not image["software_list"] and not image["vulnerabilities"]:
-                    row = image_columns + EMPTY_SOFTWARE_COLUMNS + EMPTY_VULN_COLUMNS
+                # PASS 3: Bare image (no software, no vulns)
+                if not image["softwares"] and not image["vulnerabilities"]:
+                    row = image_cols + EMPTY_SOFTWARE_COLS + EMPTY_VULN_COLS
                     assert len(row) == len(CSV_HEADERS)
                     writer.writerow(row)
-                    row_count += 1
+                    total_rows += 1
 
+    # Atomic rename
     os.replace(temp_path, output_path)
-    logger.info(f"  CSV: {output_path} ({row_count:,} rows)")
-    return row_count
+    logger.info(f"  CSV: {output_path} ({total_rows:,} rows)")
+    return total_rows
 
 
 def generate_json_report(enriched_images, output_path, logger):
@@ -931,69 +1145,117 @@ def generate_json_report(enriched_images, output_path, logger):
     write_json_atomically(output_path, {
         "generatedAt": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "totalImages": len(enriched_images),
-        "eolImages": sum(1 for img in enriched_images if img["eol_base_os"] is True),
+        "eolImages": sum(1 for img in enriched_images if img["eol_base_os"]),
         "images": enriched_images,
     })
     logger.info(f"  JSON: {output_path}")
 
 
-# ============================================================================
-# CLI Argument Parsing
-# ============================================================================
-def parse_arguments():
+# =============================================================================
+# COMMAND-LINE ARGUMENT PARSING
+# =============================================================================
+
+def parse_command_line_arguments():
     parser = argparse.ArgumentParser(
         prog="qualys_cs_report",
-        description=f"Qualys Container Security — Image Report Generator v{VERSION}",
+        description=f"Qualys Container Security Image Report Generator v{VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
+  # Basic run — images in use last 30 days
   export QUALYS_ACCESS_TOKEN="eyJ..."
   python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com
-  python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com -f "operatingSystem:Ubuntu"
+
+  # Custom filter — only Ubuntu images
+  python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com \\
+      -f "operatingSystem:Ubuntu"
+
+  # Fast run — skip container counts
   python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com --skip-containers
-  python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com --threads 10 --cps 3
+
+  # More threads, faster API calls
+  python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com --concurrency 10 --cps 3
+
+  # Dry run — preview config, no API calls
   python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com --dry-run
+
+  # Force fresh run (ignore cached data)
   python3 qualys_cs_report.py -g https://gateway.qg2.apps.qualys.com --force
 """,
     )
+
     env = os.environ.get
 
-    parser.add_argument("-g", "--gateway", default=env("QUALYS_GATEWAY", DEFAULT_GATEWAY), help="Qualys gateway URL")
-    parser.add_argument("-t", "--token", default=env("QUALYS_ACCESS_TOKEN", ""), help="Access token")
-    parser.add_argument("-l", "--limit", type=int, default=int(env("QUALYS_LIMIT", DEFAULT_PAGE_LIMIT)), help="Records per page (1-250)")
-    parser.add_argument("-d", "--days", type=int, default=int(env("QUALYS_DAYS", DEFAULT_IMAGE_LOOKBACK_DAYS)), help="Image lookback days")
-    parser.add_argument("-D", "--container-scan-days", type=int, default=int(env("QUALYS_CONTAINER_SCAN_DAYS", DEFAULT_CONTAINER_SCAN_DAYS)), help="Container scan lookback days")
-    parser.add_argument("-f", "--filter", default=env("QUALYS_FILTER", ""), help="Extra filter (e.g. 'operatingSystem:Ubuntu')")
-    parser.add_argument("-o", "--output-dir", default=env("QUALYS_OUTPUT_DIR", "./qualys_report_output"), help="Output directory")
-    parser.add_argument("--skip-containers", action="store_true", default=env("QUALYS_SKIP_CONTAINER_COUNT", "").lower() == "true", help="Skip container count (faster)")
-    parser.add_argument("--force", action="store_true", help="Ignore checkpoint, fresh start")
-    parser.add_argument("--threads", type=int, default=int(env("QUALYS_THREADS", DEFAULT_THREAD_COUNT)), help=f"Parallel threads (default: {DEFAULT_THREAD_COUNT})")
-    parser.add_argument("--cps", type=int, default=int(env("QUALYS_CPS", DEFAULT_CALLS_PER_SECOND)), help=f"Max API calls/sec (default: {DEFAULT_CALLS_PER_SECOND})")
-    parser.add_argument("-r", "--retries", type=int, default=DEFAULT_MAX_RETRIES, help=f"Max retries (default: {DEFAULT_MAX_RETRIES})")
-    parser.add_argument("-C", "--curl-extra", default=env("QUALYS_CURL_EXTRA", ""), help="Extra curl args")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("-q", "--quiet", action="store_true")
+    # Connection
+    parser.add_argument("-g", "--gateway", default=env("QUALYS_GATEWAY", DEFAULT_GATEWAY),
+                        help="Qualys gateway URL")
+    parser.add_argument("-t", "--token", default=env("QUALYS_ACCESS_TOKEN", ""),
+                        help="Access token (default: $QUALYS_ACCESS_TOKEN)")
+
+    # Query parameters
+    parser.add_argument("-l", "--limit", type=int,
+                        default=int(env("QUALYS_LIMIT", DEFAULT_PAGE_LIMIT)),
+                        help=f"Results per page, 1-250 (default: {DEFAULT_PAGE_LIMIT})")
+    parser.add_argument("-d", "--days", type=int,
+                        default=int(env("QUALYS_DAYS", DEFAULT_IMAGE_LOOKBACK_DAYS)),
+                        help=f"Image lookback days (default: {DEFAULT_IMAGE_LOOKBACK_DAYS})")
+    parser.add_argument("-D", "--container-scan-days", type=int,
+                        default=int(env("QUALYS_CONTAINER_SCAN_DAYS", DEFAULT_CONTAINER_SCAN_DAYS)),
+                        help=f"Container scan lookback (default: {DEFAULT_CONTAINER_SCAN_DAYS})")
+    parser.add_argument("-f", "--filter", default=env("QUALYS_FILTER", ""),
+                        help="Extra filter appended with AND (e.g. 'operatingSystem:Ubuntu')")
+
+    # Output
+    parser.add_argument("-o", "--output-dir",
+                        default=env("QUALYS_OUTPUT_DIR", "./qualys_report_output"),
+                        help="Output directory")
+
+    # Behavior
+    parser.add_argument("--skip-containers", action="store_true",
+                        default=env("QUALYS_SKIP_CONTAINER_COUNT", "").lower() == "true",
+                        help="Skip container count API calls (much faster)")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore checkpoint, start fresh")
+
+    # Performance tuning
+    parser.add_argument("--concurrency", type=int,
+                        default=int(env("QUALYS_CONCURRENCY", DEFAULT_THREAD_COUNT)),
+                        help=f"Parallel threads for container counts (default: {DEFAULT_THREAD_COUNT})")
+    parser.add_argument("--cps", type=int,
+                        default=int(env("QUALYS_CPS", DEFAULT_CALLS_PER_SECOND)),
+                        help=f"Max API calls per second (default: {DEFAULT_CALLS_PER_SECOND})")
+    parser.add_argument("-r", "--retries", type=int, default=DEFAULT_MAX_RETRIES,
+                        help=f"Max retries per failed call (default: {DEFAULT_MAX_RETRIES})")
+    parser.add_argument("-C", "--curl-extra", default=env("QUALYS_CURL_EXTRA", ""),
+                        help="Extra curl arguments (e.g. '--proxy http://proxy:8080')")
+
+    # Output control
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show debug messages")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress console output")
     parser.add_argument("--dry-run", action="store_true", help="Show config, no API calls")
 
     return parser.parse_args()
 
 
-# ============================================================================
-# Main — orchestrates all 5 phases
-# ============================================================================
+# =============================================================================
+# MAIN — orchestrates all 5 phases
+# =============================================================================
+
 def main():
-    args = parse_arguments()
+    args = parse_command_line_arguments()
     start_time = time.time()
 
-    # --- Validate inputs ---
+    # ── Validate inputs ──
     if not args.token:
-        print("ERROR: Set QUALYS_ACCESS_TOKEN or use -t <token>", file=sys.stderr)
+        print("ERROR: No access token. Set QUALYS_ACCESS_TOKEN or use -t <token>",
+              file=sys.stderr)
         sys.exit(1)
+
     if not args.gateway.startswith("https://"):
         print("ERROR: Gateway must use HTTPS", file=sys.stderr)
         sys.exit(1)
 
-    # --- Setup directories, logging, lock ---
+    # ── Setup directories, logging, lock file ──
     output_dir = args.output_dir
     pages_dir = os.path.join(output_dir, "pages")
     raw_dir = os.path.join(output_dir, "raw")
@@ -1001,121 +1263,152 @@ def main():
     os.makedirs(raw_dir, exist_ok=True)
 
     logger, log_file_path = setup_logging(output_dir, args.verbose, args.quiet)
-    acquire_lock(output_dir, args.force)
+    acquire_lock_file(output_dir, args.force)
 
-    # --- Build API URLs ---
+    # ── Build API URLs ──
     base_api_url = f"{args.gateway.rstrip('/')}/csapi/{DEFAULT_API_VERSION}"
+
     image_filter = build_image_api_filter(args.days, args.filter)
     eol_filter = build_image_api_filter(
         args.days,
-        f"vulnerabilities.title%3AEOL" + (f"%20and%20{args.filter.replace(' ', '%20')}" if args.filter else "")
+        "vulnerabilities.title%3AEOL" + (
+            f"%20and%20{args.filter.replace(' ', '%20')}" if args.filter else ""
+        )
     )
+
     image_list_url = f"{base_api_url}/images/list?filter={image_filter}&limit={args.limit}"
     eol_list_url = f"{base_api_url}/images/list?filter={eol_filter}&limit={args.limit}"
 
-    # --- Banner ---
+    # ── Print banner ──
     logger.info(f"Qualys CS Report Generator v{VERSION}")
     logger.info(f"Gateway:     {args.gateway}")
     logger.info(f"Output:      {output_dir}")
     logger.info(f"Params:      limit={args.limit} days={args.days} container_days={args.container_scan_days}")
-    logger.info(f"Performance: {args.threads} threads, {args.cps} calls/sec max, {args.retries} retries")
+    logger.info(f"Performance: {args.concurrency} threads, {args.cps} calls/sec, {args.retries} retries")
     if args.filter:
         logger.info(f"Filter:      {args.filter}")
 
-    # --- Dry run ---
+    # ── Dry run — show config and exit ──
     if args.dry_run:
         logger.info(f"\nDRY RUN — no API calls will be made")
-        logger.info(f"Image API:     {image_list_url}")
-        logger.info(f"EOL API:       {eol_list_url}")
-        logger.info(f"Container API: {base_api_url}/containers?filter=state:RUNNING+imageSha:<SHA>+lastVmScanDate:[now-{args.container_scan_days}d...now]")
+        logger.info(f"Image URL:     {image_list_url}")
+        logger.info(f"EOL URL:       {eol_list_url}")
+        logger.info(f"Container URL: {base_api_url}/containers?filter=state:RUNNING AND imageSha:<SHA>")
         return
 
-    # --- Checkpoint (idempotent resume) ---
-    checkpoint = Checkpoint(output_dir, generate_config_fingerprint(args))
-    if checkpoint.is_done("complete") and not args.force:
-        logger.info("Previous run already complete. Use --force for fresh start.")
+    # ── Initialize checkpoint, rate limiter, API client ──
+    checkpoint = CheckpointManager(output_dir, generate_config_fingerprint(args))
+
+    if checkpoint.is_phase_complete("complete") and not args.force:
+        logger.info("Previous run already complete. Use --force for a fresh run.")
         return
     if args.force:
-        checkpoint.clear()
+        checkpoint.clear_all()
 
-    # --- Create rate limiter and API client ---
     rate_limiter = GlobalRateLimiter(args.cps, logger)
-    api_client = QualysAPIClient(
-        args.gateway, args.token, args.retries,
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
-        args.curl_extra, rate_limiter, logger,
+    api_client = QualysApiClient(
+        gateway_url=args.gateway,
+        access_token=args.token,
+        max_retries=args.retries,
+        connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        extra_curl_args=args.curl_extra,
+        rate_limiter=rate_limiter,
+        logger=logger,
     )
 
     # ================================================================
     # PHASE 1: Fetch all images
     # ================================================================
-    all_images_file = os.path.join(raw_dir, "all_images.json")
-    if checkpoint.is_done("images"):
-        logger.info("\n[Phase 1] Images — cached")
-        all_images = json.load(open(all_images_file))
+    all_images_cache = os.path.join(raw_dir, "all_images.json")
+
+    if checkpoint.is_phase_complete("images"):
+        logger.info("\n[Phase 1] Images — loaded from cache")
+        all_images = json.load(open(all_images_cache))
     else:
-        logger.info("\n[Phase 1] Fetching images...")
+        logger.info("\n[Phase 1] Fetching all images...")
         all_images = api_client.fetch_all_pages(image_list_url, pages_dir, "img", args.limit)
-        write_json_atomically(all_images_file, all_images)
-        checkpoint.mark_done("images")
+        write_json_atomically(all_images_cache, all_images)
+        checkpoint.mark_complete("images")
+
     logger.info(f"  Total: {len(all_images)} images")
-    if not all_images:
-        logger.warning("  WARNING: 0 images returned. Check gateway, token, and filter.")
+
+    if len(all_images) == 0:
+        logger.warning("  WARNING: 0 images returned. Check your gateway, token, and filter.")
 
     # ================================================================
     # PHASE 2: Fetch EOL images and compare SHAs
     # ================================================================
-    eol_shas_file = os.path.join(raw_dir, "eol_shas.json")
-    if checkpoint.is_done("eol"):
-        logger.info("\n[Phase 2] EOL images — cached")
-        eol_image_shas = set(json.load(open(eol_shas_file)))
+    eol_cache = os.path.join(raw_dir, "eol_shas.json")
+
+    if checkpoint.is_phase_complete("eol"):
+        logger.info("\n[Phase 2] EOL images — loaded from cache")
+        eol_image_shas = set(json.load(open(eol_cache)))
     else:
-        logger.info("\n[Phase 2] Fetching EOL images...")
+        logger.info("\n[Phase 2] Fetching EOL base OS images...")
         eol_images = api_client.fetch_all_pages(eol_list_url, pages_dir, "eol", args.limit)
         eol_image_shas = set(img["sha"] for img in eol_images if img.get("sha"))
-        write_json_atomically(eol_shas_file, list(eol_image_shas))
-        checkpoint.mark_done("eol")
-    logger.info(f"  EOL images: {len(eol_image_shas)}")
+        write_json_atomically(eol_cache, list(eol_image_shas))
+        checkpoint.mark_complete("eol")
+
+    logger.info(f"  EOL Base OS images: {len(eol_image_shas)}")
 
     # ================================================================
-    # PHASE 3: Fetch container counts (PARALLEL)
+    # PHASE 3: Fetch container counts (parallel)
     # ================================================================
+    container_counts_cache = os.path.join(raw_dir, "container_counts.json")
     container_counts = {}
+
     if args.skip_containers:
-        logger.info("\n[Phase 3] Container counts — skipped")
-    elif checkpoint.is_done("containers"):
-        logger.info("\n[Phase 3] Container counts — cached")
-        container_counts = json.load(open(os.path.join(raw_dir, "container_counts.json")))
+        logger.info("\n[Phase 3] Container counts — skipped (--skip-containers)")
+
+    elif checkpoint.is_phase_complete("containers"):
+        logger.info("\n[Phase 3] Container counts — loaded from cache")
+        container_counts = json.load(open(container_counts_cache))
+
     else:
         logger.info("\n[Phase 3] Fetching container counts (parallel)...")
         unique_shas = list(set(img["sha"] for img in all_images if img.get("sha")))
 
-        # Load partial progress (resume after Ctrl+C)
-        counts_file = os.path.join(raw_dir, "container_counts.json")
-        if os.path.exists(counts_file):
+        # Load partial progress if available (resume support)
+        if os.path.exists(container_counts_cache):
             try:
-                container_counts = json.load(open(counts_file))
+                container_counts = json.load(open(container_counts_cache))
             except (json.JSONDecodeError, KeyError):
                 container_counts = {}
 
         container_counts = fetch_container_counts_parallel(
             api_client, base_api_url, unique_shas, args.container_scan_days,
-            container_counts, raw_dir, args.threads, logger,
+            container_counts, raw_dir, args.concurrency, logger,
         )
-        checkpoint.mark_done("containers")
+        checkpoint.mark_complete("containers")
 
     # ================================================================
     # PHASE 4: Generate reports
     # ================================================================
     logger.info("\n[Phase 4] Generating reports...")
-    enriched_images = build_enriched_image_list(all_images, eol_image_shas, container_counts, args.skip_containers)
-    csv_row_count = generate_csv_report(enriched_images, os.path.join(output_dir, "qualys_cs_unified_report.csv"), logger)
-    generate_json_report(enriched_images, os.path.join(output_dir, "images_full_report.json"), logger)
+
+    enriched_images = build_enriched_image_list(
+        all_images, eol_image_shas, container_counts, args.skip_containers
+    )
+
+    csv_row_count = generate_csv_report(
+        enriched_images,
+        os.path.join(output_dir, "qualys_cs_unified_report.csv"),
+        logger,
+    )
+
+    generate_json_report(
+        enriched_images,
+        os.path.join(output_dir, "images_full_report.json"),
+        logger,
+    )
 
     # ================================================================
     # PHASE 5: Run summary
     # ================================================================
     total_duration = int(time.time() - start_time)
+
     run_summary = {
         "version": VERSION,
         "timestamp": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1123,29 +1416,34 @@ def main():
         "filter": args.filter or f"imagesInUse last {args.days}d",
         "total_images": len(enriched_images),
         "unique_images": len(set(img["image_sha"] for img in enriched_images)),
-        "eol_images": sum(1 for img in enriched_images if img["eol_base_os"] is True),
+        "eol_images": sum(1 for img in enriched_images if img["eol_base_os"]),
         "total_vulnerabilities": sum(img["vulnerability_count"] for img in enriched_images),
         "csv_rows": csv_row_count,
+        "csv_columns": len(CSV_HEADERS),
         "duration": format_duration(total_duration),
         "api_calls": api_client.total_api_calls,
         "retries": api_client.total_retries,
         "errors": api_client.total_errors,
         "throttle_events": rate_limiter.total_throttle_events,
         "throttle_seconds": rate_limiter.total_throttle_seconds,
-        "threads": args.threads,
+        "concurrency": args.concurrency,
         "calls_per_second": args.cps,
     }
-    write_json_atomically(os.path.join(output_dir, "run_summary.json"), run_summary)
-    checkpoint.mark_done("complete")
 
-    # --- Final output ---
+    write_json_atomically(os.path.join(output_dir, "run_summary.json"), run_summary)
+    checkpoint.mark_complete("complete")
+
+    # ── Final output ──
     logger.info(f"\n{'=' * 55}")
     logger.info(f"  DONE in {format_duration(total_duration)}")
     logger.info(f"  Images: {run_summary['total_images']} | EOL: {run_summary['eol_images']} | Vulns: {run_summary['total_vulnerabilities']}")
-    logger.info(f"  CSV: {csv_row_count:,} rows | API: {api_client.total_api_calls} calls | Throttles: {rate_limiter.total_throttle_events}")
+    logger.info(f"  CSV: {csv_row_count:,} rows × {len(CSV_HEADERS)} cols | API: {api_client.total_api_calls} calls")
     logger.info(f"  Output: {output_dir}/")
     logger.info(f"{'=' * 55}")
 
 
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 if __name__ == "__main__":
     main()
