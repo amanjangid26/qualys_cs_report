@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-  Qualys Container Security — Image Report Generator
+  Qualys Container Security - Image Report Generator
   Version: 3.0.0
 =============================================================================
 
@@ -272,8 +272,9 @@ def generate_jwt_token(gateway_url, username, password, connect_timeout, logger)
         logger.error(f"  Authentication failed: {error}")
         sys.exit(1)
 
-    if http_code == 200 and response_body:
+    if http_code in (200, 201) and response_body:
         # The response body IS the JWT token (plain text, not JSON)
+        # Qualys returns 200 or 201 depending on the platform version
         token = response_body.strip()
         if token.startswith("eyJ"):
             logger.info(f"  Token obtained: {token[:15]}...{token[-6:]} (valid 4 hours)")
