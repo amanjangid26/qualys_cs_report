@@ -1,4 +1,4 @@
-# Qualys Container Security - Image Report Generator
+# Qualys Container Security — Image Report Generator
 
 Enterprise CLI tool that pulls container image records from Qualys CSAPI, enriches them with running container counts, EOL base OS status, and software lifecycle dates, and produces a unified CSV + JSON report.
 
