@@ -2,7 +2,7 @@
 
 Enterprise CLI tool that pulls container image records from Qualys CSAPI, enriches them with running container counts, EOL base OS status, and software lifecycle dates, and produces a unified CSV + JSON report.
 
-[![Version](https://img.shields.io/badge/version-2.2.0-blue)](https://github.com/amanjangid26/qualys_cs_report)
+[![Version](https://img.shields.io/badge/version-3.0.0-blue)](https://github.com/amanjangid26/qualys_cs_report)
 [![Python](https://img.shields.io/badge/python-3.8%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)](LICENSE)
 
@@ -12,18 +12,16 @@ Enterprise CLI tool that pulls container image records from Qualys CSAPI, enrich
 
 | Feature | Description |
 |---------|-------------|
-| **Single CSV output** | Fully denormalized — every image, software, vulnerability, lifecycle date, and container count in one file. Open in Excel and filter. |
-| **EOL Base OS detection** | Compares image SHAs between main API and EOL-filtered API. Match → `EOL_Base_OS = True`. |
+| **Automatic JWT authentication** | Uses Qualys username + password to auto-generate a JWT token. No manual token management. |
+| **Single CSV output** | Fully denormalized — every image, software, lifecycle date, and container count in one file. |
+| **EOL Base OS detection** | Compares image SHAs between main API and EOL-filtered API. Match → `EOL_Base_OS = True`. Empty for distroless. |
 | **Container count enrichment** | Queries running container count per image SHA in parallel. Know your blast radius. |
-| **Software lifecycle dates** | GA (general availability), EOL (end of life), and EOS (end of support) dates for installed packages. |
-| **Image source tracking** | Shows where Qualys discovered the image: GENERAL, REGISTRY, HOST, CICD, etc. |
-| **Parallel execution** | Phase 3 (container counts) uses multiple threads with coordinated rate limiting. |
-| **Idempotent** | Checkpoint after each phase. Re-run to resume, not restart. `--force` for fresh. |
-| **Global rate limiter** | All threads coordinate via token bucket. Reads `X-RateLimit-Remaining`, auto-slows, honours `Retry-After` on 429. |
-| **Custom filters** | Append any Qualys filter with `-f` (e.g. `operatingSystem:Ubuntu`, `repo.registry:docker.io`). |
-| **Atomic writes** | All output files written to temp first, then renamed. No corrupt files on crash. |
-| **Lock file** | Prevents concurrent runs against the same output directory. |
-| **Signal handling** | `Ctrl+C` saves state and exits cleanly. Re-run to resume. |
+| **Software lifecycle dates** | GA, EOL, and EOS dates for installed packages. |
+| **Package path tracking** | Shows where each software was found inside the image. |
+| **Distroless-aware** | Images with no OS → `EOL_Base_OS` left empty (not evaluated). |
+| **Parallel execution** | Phase 3 uses multiple threads with coordinated global rate limiting. |
+| **Idempotent** | Checkpoint after each phase. Re-run to resume, not restart. |
+| **Custom filters** | Append any Qualys filter with `-f`. |
 
 ---
 
@@ -36,14 +34,11 @@ Enterprise CLI tool that pulls container image records from Qualys CSAPI, enrich
 # Ubuntu / Debian
 sudo apt-get install -y python3 curl
 
-# RHEL / Amazon Linux
-sudo yum install -y python3 curl
-
 # macOS
 brew install python3 curl
 ```
 
-No pip packages required — uses only Python standard library.
+No pip packages required.
 
 ---
 
@@ -54,93 +49,98 @@ No pip packages required — uses only Python standard library.
 git clone https://github.com/amanjangid26/qualys_cs_report.git
 cd qualys_cs_report
 
-# 2. Set your token
-export QUALYS_ACCESS_TOKEN="eyJ..."
+# 2. Set credentials (use SINGLE QUOTES to handle special characters)
+export QUALYS_USERNAME='myuser'
+export QUALYS_PASSWORD='myP@ss&word#1!'
 
 # 3. Run
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com"
 ```
 
-Reports land in `./qualys_report_output/`.
+The script automatically generates a JWT token and uses it for all API calls. Reports land in `./qualys_report_output/`.
 
 ---
 
-## Getting Your Access Token
+## Authentication
 
-1. Log in to the **Qualys Platform**
-2. Navigate to **CS (Container Security)** module
-3. Go to **Configurations** → **Access Token** tab
-4. Under **LINUX**, click **COPY**
-5. `export QUALYS_ACCESS_TOKEN="eyJ..."`
+The script uses the [Qualys Authentication API](https://docs.qualys.com/en/cs/1.41.0/mergedProjects/container_security_apis/get_started/get_started.htm) to generate a JWT token:
 
-> **Never commit tokens to git.** Use environment variables, Vault, or a secrets manager.
+```
+POST https://<gateway>/auth
+Content-Type: application/x-www-form-urlencoded
+Body: username=<user>&password=<pass>&token=true
+```
+
+The token is valid for 4 hours. You don't need to manage tokens manually — just provide username + password.
+
+### Setting Credentials
+
+Use **single quotes** when exporting credentials — this safely handles special characters like `!`, `$`, `&`, `#`, spaces, etc.
+
+```bash
+export QUALYS_USERNAME='admin@corp.com'
+export QUALYS_PASSWORD='P@ss&word#1!$pecial'
+```
+
+Or pass directly via flags:
+```bash
+python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
+    -u 'admin@corp.com' -p 'P@ss&word#1!'
+```
+
+The script URL-encodes credentials before sending them to the Qualys `/auth` endpoint, so all special characters work correctly.
+
+> **Never commit credentials to git.** Use environment variables, Vault, or a secrets manager.
 
 ---
 
 ## Usage
 
 ```bash
-# Basic — images in use last 30 days
+# Basic
+export QUALYS_USERNAME='myuser'
+export QUALYS_PASSWORD='myP@ssword'
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com"
 
-# Dry run — preview config, no API calls
+# Dry run
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" --dry-run
 
-# Skip container counts (much faster)
+# Skip container counts (faster)
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" --skip-containers
 
-# Custom filter — only Ubuntu images
+# Custom filter
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
     -f "operatingSystem:Ubuntu"
 
-# Custom filter — specific registry
-python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
-    -f "repo.registry:docker.io"
-
-# Custom filter — images with critical vulns
-python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
-    -f "vulnerabilities.severity:5"
-
-# More threads + faster API calls (for large environments)
+# More threads
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
     --concurrency 10 --cps 3
 
-# Custom lookback
-python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" -d 7 -D 5
-
-# Force fresh run (ignore checkpoint)
+# Force fresh run
 python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" --force
-
-# Via proxy
-python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" \
-    -C "--proxy http://proxy.corp.com:8080"
-
-# Quiet (cron/CI)
-python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" -q
 ```
 
 ### CLI Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `-u`, `--username` | Qualys username | `$QUALYS_USERNAME` |
+| `-p`, `--password` | Qualys password | `$QUALYS_PASSWORD` |
 | `-g`, `--gateway` | Qualys gateway URL | `$QUALYS_GATEWAY` |
-| `-t`, `--token` | Access token | `$QUALYS_ACCESS_TOKEN` |
 | `-l`, `--limit` | Results per page (1–250) | 250 |
 | `-d`, `--days` | Image lookback days | 30 |
 | `-D`, `--container-scan-days` | Container scan lookback | 3 |
-| `-f`, `--filter` | Extra filter appended with AND (e.g. `operatingSystem:Ubuntu`) | — |
+| `-f`, `--filter` | Extra filter (e.g. `operatingSystem:Ubuntu`) | — |
 | `-o`, `--output-dir` | Output directory | `./qualys_report_output` |
-| `--skip-containers` | Skip container count API calls (faster) | false |
+| `--skip-containers` | Skip container count API calls | false |
 | `--force` | Ignore checkpoint, start fresh | false |
-| `--concurrency` | Parallel threads for container counts | 5 |
-| `--cps` | Max API calls per second (across all threads) | 2 |
-| `-r`, `--retries` | Max retries per API call | 2 |
-| `-C`, `--curl-extra` | Extra curl args (e.g. `--proxy`) | — |
+| `--concurrency` | Parallel threads | 5 |
+| `--cps` | Max API calls/sec | 2 |
+| `-r`, `--retries` | Max retries per call | 2 |
+| `-C`, `--curl-extra` | Extra curl args | — |
 | `-v`, `--verbose` | Debug output | false |
-| `-q`, `--quiet` | Suppress console output | false |
-| `--dry-run` | Preview config, no API calls | false |
-
-All flags can also be set via environment variables with `QUALYS_` prefix.
+| `-q`, `--quiet` | Suppress console | false |
+| `--dry-run` | Preview config only | false |
 
 ---
 
@@ -148,105 +148,62 @@ All flags can also be set via environment variables with `QUALYS_` prefix.
 
 ```
 qualys_report_output/
-├── qualys_cs_unified_report.csv     ← Main report (open in Excel)
+├── qualys_cs_unified_report.csv     ← Main report
 ├── images_full_report.json          ← Complete JSON
-├── run_summary.json                 ← Machine-readable metadata
-├── report_YYYYMMDD_HHMMSS.log      ← Execution log
-├── pages/                           ← Raw API responses (for resume)
+├── run_summary.json                 ← Metadata
+├── report_YYYYMMDD_HHMMSS.log      ← Log
+├── pages/                           ← API page cache
 └── raw/                             ← Intermediate data
 ```
 
-### CSV Columns (32)
+### CSV Columns (25)
 
 | # | Column | Description |
 |---|--------|-------------|
 | 1 | `Image_ID` | Short 12-char image ID |
 | 2 | `Image_SHA` | Full SHA256 |
 | 3 | `Operating_System` | e.g. Debian Linux 12.13 |
-| 4 | `EOL_Base_OS` | `True`/`False` if OS present; empty for distroless/scratch images |
+| 4 | `EOL_Base_OS` | `True`/`False` if OS present; empty for distroless |
 | 5 | `Architecture` | arm64, amd64 |
 | 6 | `Image_Created` | Creation timestamp (empty if unavailable) |
 | 7 | `Image_Last_Scanned` | Last Qualys scan |
-| 8 | `Image_Scan_Types` | SCA, STATIC, DYNAMIC (image-level) |
-| 9 | `Image_Source` | Where Qualys found the image: GENERAL, REGISTRY, HOST, CICD |
+| 8 | `Image_Scan_Types` | SCA, STATIC, DYNAMIC |
+| 9 | `Image_Source` | GENERAL, REGISTRY, HOST, CICD |
 | 10 | `Registry` | e.g. mcr.microsoft.com |
 | 11 | `Repository` | e.g. aks/msi/addon-token-adapter |
 | 12 | `Image_Tag` | e.g. v1.2.3, latest |
 | 13 | `Risk_Score` | Qualys TruRisk (0–1000) |
 | 14 | `Max_QDS_Score` | Max QDS score |
 | 15 | `QDS_Severity` | CRITICAL / HIGH / MEDIUM / LOW |
-| 16 | `Total_Vulnerabilities_On_Image` | Vuln count |
-| 17 | `Running_Container_Count` | Active containers using this image |
-| 18 | `Software_Name` | Installed package |
-| 19 | `Software_Installed_Version` | Current version |
-| 20 | `Software_Fix_Version` | Fix version |
-| 21 | `Software_Package_Path` | File path of the package (e.g. app/bin/myapp) |
-| 22 | `Software_Lifecycle_Stage` | EOL/EOS, GA, Beta, etc. |
-| 23 | `Software_GA_Date` | General availability date |
-| 24 | `Software_EOL_Date` | End of life date |
-| 25 | `Software_EOS_Date` | End of support date |
-| 26 | `Vuln_QID` | Qualys vulnerability ID |
-| 27 | `Vuln_Scan_Type` | How this vuln was found (SCA/STATIC/DYNAMIC) |
-| 28 | `Vuln_Type_Detected` | CONFIRMED / POTENTIAL |
-| 29 | `Vuln_First_Found` | First detection date |
-| 30 | `Vuln_Affected_Software_Name` | Affected package |
-| 31 | `Vuln_Affected_Software_Version` | Affected version |
-| 32 | `Vuln_Fix_Version` | Remediation version |
-
-### Row Logic
-
-| Row type | Driven by | Software cols | Vuln cols |
-|----------|-----------|--------------|-----------|
-| **Vulnerability** | Each QID × affected software | Filled | Filled |
-| **Software-only** | Installed package with no vuln | Filled | Blank |
-| **Bare image** | Image with no data | Blank | Blank |
-
-Multi-registry images get **separate rows per registry** — no pipe-delimited values, clean Excel filtering.
+| 16 | `Running_Container_Count` | Active containers using this image |
+| 17 | `Software_Name` | Installed package |
+| 18 | `Software_Installed_Version` | Current version |
+| 19 | `Software_Fix_Version` | Fix version |
+| 20 | `Software_Package_Path` | File path inside the image |
+| 21 | `Software_Lifecycle_Stage` | EOL/EOS, GA, Beta, etc. |
+| 22 | `Software_GA_Date` | General availability date |
+| 23 | `Software_EOL_Date` | End of life date |
+| 24 | `Software_EOS_Date` | End of support date |
+| 25 | `Software_Scan_Type` | SCA, STATIC, DYNAMIC (per software) |
 
 ---
 
 ## How It Works
 
-### Phase 1: Fetch images
-Calls `/images/list` with pagination (follows `Link` header). Saves each page to `pages/` for resume.
+### Phase 0: Authentication
+Calls `POST /auth` with username + password to get a JWT token (valid 4 hours).
 
-### Phase 2: Fetch EOL images
-Calls `/images/list` with `vulnerabilities.title:EOL` filter. Collects SHAs. Compares against Phase 1 SHAs: match → `EOL_Base_OS = True`.
+### Phase 1: Fetch images
+Paginated calls to `/images/list`. Saves pages for resume.
+
+### Phase 2: EOL detection
+Fetches images with `vulnerabilities.title:EOL` filter. Compares SHAs. Distroless images (no OS) → EOL left empty.
 
 ### Phase 3: Container counts (parallel)
-For each unique image SHA, calls `/containers` to get running container count. Uses multiple threads with a global rate limiter. HTTP 204 = 0 containers (not an error). Checkpoints every 100 SHAs.
+Calls `/containers` per SHA using thread pool. HTTP 204 = 0 containers. Rate-limit coordinated.
 
 ### Phase 4: Report generation
-Denormalizes everything into a single CSV + full JSON. Atomic writes.
-
-### Idempotency
-Each phase writes a checkpoint file. On re-run:
-- **Same config** → resumes from last checkpoint
-- **Config changed** → starts fresh automatically
-- **`--force`** → clears checkpoint, starts fresh
-- **Ctrl+C mid-run** → saves state, resume on next run
-
-### Rate Limiting
-```
-All threads call acquire() before each API call
-───────────────────────────────────────────────
-remaining > 20       →  continue at configured CPS
-remaining ≤ 20       →  slow to 1 call/sec
-remaining = 0        →  ALL threads pause for window reset + 5s
-HTTP 429             →  ALL threads pause (Retry-After or window reset)
-```
-
----
-
-## Performance Tuning
-
-| Scenario | Recommended flags |
-|----------|-------------------|
-| Small environment (< 100 images) | Default settings |
-| Medium (100–1000 images) | `--concurrency 10 --cps 3` |
-| Large (1000–5000 images) | `--concurrency 10 --cps 4` |
-| Very large (5000+ images) | `--concurrency 15 --cps 5` |
-| Quick scan (skip containers) | `--skip-containers` |
+Flat CSV + JSON. Atomic writes.
 
 ---
 
@@ -274,16 +231,13 @@ HTTP 429             →  ALL threads pause (Retry-After or window reset)
 
 | Issue | Fix |
 |-------|-----|
-| `HTTP 401` | Token expired — regenerate from Qualys CS → Configurations → Access Token |
-| `HTTP 403` | Token lacks CSAPI scope |
-| `HTTP 404` | Wrong gateway URL — check your region |
+| `HTTP 401` at auth | Wrong username/password |
+| `HTTP 401` during API calls | JWT expired (>4 hours). Re-run to get a new token. |
+| `HTTP 403` | User lacks CS API Access permission |
 | `HTTP 429` | Handled automatically. Reduce `--cps` if persistent. |
-| `Another instance running` | Wait, or use `--force` |
-| `Running_Container_Count = N/A` | Used `--skip-containers` |
-| `Image_Created empty` | Qualys API returns epoch 0 for some images (no creation date recorded) |
-| `Operating_System empty` | Qualys couldn't detect the base OS (scratch/distroless images) |
-| `EOL_Base_OS empty` | No OS detected — EOL evaluation is skipped for distroless images |
-| Slow run | Use `--skip-containers`, or increase `--concurrency` and `--cps` |
+| `EOL_Base_OS empty` | Distroless image — no OS to evaluate |
+| `Operating_System empty` | Qualys couldn't detect the base OS |
+| `Image_Created empty` | Qualys has no creation date for this image |
 
 ---
 
