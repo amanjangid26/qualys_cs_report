@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-  Qualys Container Security — Image Report Generator
+  Qualys Container Security - Image Report Generator
   Version: 3.0.0
 =============================================================================
 
