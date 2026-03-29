@@ -129,7 +129,6 @@ python3 qualys_cs_report.py -g "https://gateway.qg2.apps.qualys.com" --force
 | `-g`, `--gateway` | Qualys gateway URL | `$QUALYS_GATEWAY` |
 | `-l`, `--limit` | Results per page (1–250) | 250 |
 | `-d`, `--days` | Image lookback days | 30 |
-| `-D`, `--container-scan-days` | Container scan lookback | 3 |
 | `-f`, `--filter` | Extra filter (e.g. `operatingSystem:Ubuntu`) | — |
 | `-o`, `--output-dir` | Output directory | `./qualys_report_output` |
 | `--skip-containers` | Skip container count API calls | false |
@@ -191,19 +190,60 @@ qualys_report_output/
 ## How It Works
 
 ### Phase 0: Authentication
-Calls `POST /auth` with username + password to get a JWT token (valid 4 hours).
+Calls `POST /auth` with username + password to get a JWT token (valid 4 hours). Credentials are URL-encoded automatically so special characters like `@`, `&`, `$`, `!` work correctly.
 
 ### Phase 1: Fetch images
-Paginated calls to `/images/list`. Saves pages for resume.
+Calls `GET /images/list?filter=imagesInUse:[now-30d...now]` with pagination. The API returns up to 250 images per page with a `Link` header pointing to the next page. Each page is saved to disk (`pages/img_0001.json`, `img_0002.json`, ...) for crash recovery.
 
 ### Phase 2: EOL detection
-Fetches images with `vulnerabilities.title:EOL` filter. Compares SHAs. Distroless images (no OS) → EOL left empty.
+Calls the same Image API with an extra filter: `vulnerabilities.title:EOL`. This returns only images where Qualys flagged the base OS as end-of-life. SHAs are compared against Phase 1:
+
+| Image has OS? | SHA in EOL list? | EOL_Base_OS |
+|---|---|---|
+| Yes | Yes | `True` |
+| Yes | No | `False` |
+| No (distroless) | N/A | *(empty)* |
 
 ### Phase 3: Container counts (parallel)
-Calls `/containers` per SHA using thread pool. HTTP 204 = 0 containers. Rate-limit coordinated.
+For each unique image SHA, calls the Container API:
+```
+GET /containers?filter=state:RUNNING AND imageSha:<SHA> AND lastVmScanDate:[now-3d...now]
+```
+The `lastVmScanDate` filter is hardcoded to 3 days — only recently scanned containers are counted, avoiding stale data.
 
-### Phase 4: Report generation
-Flat CSV + JSON. Atomic writes.
+Uses a thread pool (default: 5 threads) with a global rate limiter. HTTP 204 = 0 containers (valid, not an error).
+
+### Phase 4: Report generation (streaming)
+Reads page files from disk one at a time — never loads all images into memory. For each image, builds CSV rows and writes them immediately. Memory stays at ~30 MB whether you have 76 images or 10,000.
+
+### Idempotency (safe to re-run)
+
+Each phase saves a checkpoint. If the script crashes or you press Ctrl+C:
+- Re-run → skips completed phases, resumes where it left off
+- Change config (e.g. `--days 7`) → checkpoint resets automatically
+- `--force` → clears checkpoint, starts completely fresh
+
+### Rate Limiting
+
+Qualys APIs have rate limits (typically 300 calls per 5-minute window). The script reads `X-RateLimit-Remaining` from every response and adjusts:
+
+```
+remaining > 20    →  continue at configured calls/sec
+remaining ≤ 20    →  slow to 1 call/sec
+remaining = 0     →  ALL threads pause until window resets
+HTTP 429          →  ALL threads pause (honour Retry-After header)
+```
+
+### Memory Usage
+
+| Images | Peak Memory | CSV Rows | CSV Size |
+|--------|-------------|----------|----------|
+| 76 | ~13 MB | 11,479 | 4 MB |
+| 500 | ~29 MB | 79,898 | 19 MB |
+| 1,000 | ~29 MB | 164,338 | 39 MB |
+| 5,000 | ~31 MB | 844,722 | 200 MB |
+
+Memory is constant because images are streamed from page files, not held in a list.
 
 ---
 
