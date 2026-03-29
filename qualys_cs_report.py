@@ -5,53 +5,44 @@
   Version: 3.0.0
 =============================================================================
 
-  WHAT THIS SCRIPT DOES:
+  This script connects to Qualys Container Security APIs, fetches all
+  container images, and produces a CSV + JSON report with software inventory,
+  lifecycle dates, EOL status, and running container counts.
 
-  It talks to Qualys Container Security APIs and builds a single CSV + JSON
-  report containing every container image, its installed software, lifecycle
-  dates (GA/EOL/EOS), running container count, and whether the base operating
-  system is end-of-life.
-
-  AUTHENTICATION:
-
-  Uses Qualys username + password to automatically generate a JWT token.
-  The token is generated at startup by calling:
-      POST https://<gateway>/auth
-      username=<user>&password=<pass>&token=true
-  The JWT is valid for 4 hours and is used for all subsequent API calls.
-  No need to manually copy tokens from the Qualys UI.
-
-  HOW IT WORKS (5 phases):
+  HOW IT WORKS:
 
   Phase 0 — AUTHENTICATION
-      Calls the Qualys /auth endpoint with username + password to get a
-      JWT (JSON Web Token). This token is then used in the Authorization
-      header for all subsequent API calls.
+      POST /auth with username + password → JWT token (valid 4 hours).
+      Credentials are URL-encoded to handle special characters.
 
-  Phase 1 — IMAGE LIST
-      Calls the Qualys Image Bulk API to fetch all container images that
-      were in use during the last N days. Handles pagination automatically.
+  Phase 1 — FETCH ALL IMAGES
+      GET /images/list with pagination (250 per page via Link header).
+      Each page saved to disk as pages/img_NNNN.json for crash recovery.
 
   Phase 2 — EOL BASE OS DETECTION
-      Calls the same Image API with "vulnerabilities.title:EOL" filter.
-      Compares SHAs against Phase 1:
-          SHA match AND image has an OS → EOL_Base_OS = True
-          SHA only in Phase 1 AND has OS → EOL_Base_OS = False
-          Image has NO OS (distroless)   → EOL_Base_OS = empty
+      Same API with "vulnerabilities.title:EOL" filter → collects SHAs.
+      Compared against Phase 1:
+          Has OS + SHA in EOL list  → EOL_Base_OS = True
+          Has OS + SHA not in list  → EOL_Base_OS = False
+          No OS (distroless)        → EOL_Base_OS = empty
 
   Phase 3 — CONTAINER COUNTS (parallel)
-      For each unique image SHA, calls the Container API in parallel to
-      find running container count. Uses global rate limiter across threads.
+      GET /containers per SHA with filters:
+          state:RUNNING AND imageSha:<SHA> AND lastVmScanDate:[now-3d...now]
+      Hardcoded to 3-day lookback for recently scanned containers.
+      Uses thread pool (default 5) with global rate limiter.
       HTTP 204 = 0 containers (valid, not an error).
 
-  Phase 4 — REPORT GENERATION
-      Builds a single flat CSV (25 columns) + JSON report.
-      One row per (image × repo × software). No vulnerability columns.
+  Phase 4 — CSV + JSON REPORTS (streaming)
+      Reads page files one at a time (never loads all images into memory).
+      Memory stays ~30 MB regardless of image count.
+      25 columns: image metadata + software details + lifecycle dates.
 
   Phase 5 — RUN SUMMARY
+      Writes run_summary.json with stats.
 
-  IDEMPOTENT: re-run resumes from checkpoint. --force for fresh start.
-  PREREQUISITES: Python 3.8+, curl
+  IDEMPOTENT: checkpoint after each phase. Re-run resumes. --force resets.
+  PREREQUISITES: Python 3.8+, curl, no pip packages.
 =============================================================================
 """
 
@@ -86,7 +77,6 @@ DEFAULT_GATEWAY             = "https://gateway.qg2.apps.qualys.com"
 DEFAULT_API_VERSION         = "v1.3"
 DEFAULT_PAGE_LIMIT          = 250
 DEFAULT_IMAGE_LOOKBACK_DAYS = 30
-DEFAULT_CONTAINER_SCAN_DAYS = 3
 DEFAULT_MAX_RETRIES         = 2
 DEFAULT_CONNECT_TIMEOUT     = 15
 DEFAULT_REQUEST_TIMEOUT     = 60
@@ -151,7 +141,7 @@ def remove_file_silently(file_path):
     except OSError: pass
 
 def generate_config_fingerprint(args):
-    config_string = (f"{args.gateway}|{args.days}|{args.container_scan_days}"
+    config_string = (f"{args.gateway}|{args.days}"
                      f"|{args.limit}|{args.skip_containers}|{args.filter or ''}")
     return hashlib.sha256(config_string.encode()).hexdigest()[:16]
 
@@ -491,8 +481,10 @@ class QualysApiClient:
 # =============================================================================
 # PARALLEL CONTAINER COUNTS
 # =============================================================================
-def fetch_container_counts_parallel(api_client, base_api_url, image_shas, container_scan_days,
+def fetch_container_counts_parallel(api_client, base_api_url, image_shas,
                                      existing_counts, raw_directory, thread_count, logger):
+    """Fetch running container count per SHA in parallel.
+    Uses hardcoded 3-day lastVmScanDate filter to count only recently scanned containers."""
     shas_to_fetch = [sha for sha in image_shas if sha not in existing_counts]
     if not shas_to_fetch:
         logger.info(f"  All {len(image_shas)} cached"); return existing_counts
@@ -502,8 +494,9 @@ def fetch_container_counts_parallel(api_client, base_api_url, image_shas, contai
 
     def fetch_single(sha):
         nonlocal completed
+        # lastVmScanDate filter hardcoded to 3 days — only count recently scanned containers
         url = (f"{base_api_url}/containers?filter=state%3A%20%60RUNNING%60%20and%20imageSha%3A{sha}"
-               f"%20and%20lastVmScanDate%3A%5Bnow-{container_scan_days}d%20...%20now%5D")
+               f"%20and%20lastVmScanDate%3A%5Bnow-3d%20...%20now%5D")
         tmp = os.path.join(raw_directory, f"_cc_{sha[:12]}_{threading.current_thread().ident}.json")
         code = api_client.make_request(url, tmp)
         count = 0
@@ -633,8 +626,6 @@ examples:
     # Query
     parser.add_argument("-l", "--limit", type=int, default=int(env("QUALYS_LIMIT", DEFAULT_PAGE_LIMIT)))
     parser.add_argument("-d", "--days", type=int, default=int(env("QUALYS_DAYS", DEFAULT_IMAGE_LOOKBACK_DAYS)))
-    parser.add_argument("-D", "--container-scan-days", type=int,
-                        default=int(env("QUALYS_CONTAINER_SCAN_DAYS", DEFAULT_CONTAINER_SCAN_DAYS)))
     parser.add_argument("-f", "--filter", default=env("QUALYS_FILTER", ""))
     # Output
     parser.add_argument("-o", "--output-dir", default=env("QUALYS_OUTPUT_DIR", "./qualys_report_output"))
@@ -875,7 +866,7 @@ def main():
     logger.info(f"Gateway:     {args.gateway}")
     logger.info(f"Username:    {args.username}")
     logger.info(f"Output:      {output_dir}")
-    logger.info(f"Params:      limit={args.limit} days={args.days} cdays={args.container_scan_days}")
+    logger.info(f"Params:      limit={args.limit} days={args.days}")
     logger.info(f"Performance: {args.concurrency} threads, {args.cps} calls/sec, {args.retries} retries")
     if args.filter: logger.info(f"Filter:      {args.filter}")
 
@@ -950,7 +941,7 @@ def main():
             try: container_counts = json.load(open(cc_file))
             except: container_counts = {}
         container_counts = fetch_container_counts_parallel(
-            api_client, base_api_url, unique_shas, args.container_scan_days,
+            api_client, base_api_url, unique_shas,
             container_counts, raw_dir, args.concurrency, logger)
         checkpoint.mark_complete("containers")
 
