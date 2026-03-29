@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-  Qualys Container Security — Image Report Generator
+  Qualys Container Security - Image Report Generator
   Version: 3.0.0
 =============================================================================
 
@@ -572,6 +572,22 @@ CSV_HEADERS = [
 IMAGE_COLUMN_COUNT    = 16
 SOFTWARE_COLUMN_COUNT = 9
 EMPTY_SOFTWARE_COLS   = [""] * SOFTWARE_COLUMN_COUNT
+
+
+def build_software_columns(software):
+    """Build the 9 software-level columns for one CSV row."""
+    lifecycle = software.get("lifecycle") or {}
+    return [
+        convert_to_safe_string(software.get("name")),
+        convert_to_safe_string(software.get("version")),
+        convert_to_safe_string(software.get("fixVersion")),
+        convert_to_safe_string(software.get("packagePath")),
+        convert_to_safe_string(lifecycle.get("stage")),
+        convert_epoch_ms_to_iso(lifecycle.get("gaDate")),
+        convert_epoch_ms_to_iso(lifecycle.get("eolDate")),
+        convert_epoch_ms_to_iso(lifecycle.get("eosDate")),
+        convert_to_safe_string(software.get("scanType")),
+    ]
 
 
 # =============================================================================
